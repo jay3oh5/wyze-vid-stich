@@ -2,6 +2,12 @@
 target/
 **/*.rs.bk
 
+# Swift / Xcode
+.build/
+*.xcworkspace
+*.xcuserdata
+*.xcframework/
+
 # Logs
 logs
 *.log
