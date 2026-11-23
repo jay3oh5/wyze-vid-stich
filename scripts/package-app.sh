@@ -7,14 +7,20 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="WyzeVidStitch"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 
-echo "==> Building WyzeVidStitch via Swift Package Manager..."
+echo "==> Building WyzeVidStitch via Swift Package Manager (Universal2)..."
 cd "$MACOS_DIR"
-swift build -c release
 
-BIN_PATH="$MACOS_DIR/.build/release/$APP_NAME"
-if [ ! -f "$BIN_PATH" ]; then
-    # Some Swift toolchains output to apple/Products/Release
+if swift build -c release --arch arm64 --arch x86_64; then
     BIN_PATH=$(find "$MACOS_DIR/.build" -type f -name "$APP_NAME" -perm +111 | grep -v "\.dSYM" | head -n 1)
+else
+    echo "==> Falling back to individual arch build and lipo merge..."
+    swift build -c release --triple arm64-apple-macosx14.0
+    swift build -c release --triple x86_64-apple-macosx14.0
+    mkdir -p "$MACOS_DIR/.build/universal"
+    ARM_BIN=$(find "$MACOS_DIR/.build" -path "*/arm64*/$APP_NAME" -type f -perm +111 | head -n 1)
+    INTEL_BIN=$(find "$MACOS_DIR/.build" -path "*/x86_64*/$APP_NAME" -type f -perm +111 | head -n 1)
+    lipo -create "$ARM_BIN" "$INTEL_BIN" -output "$MACOS_DIR/.build/universal/$APP_NAME"
+    BIN_PATH="$MACOS_DIR/.build/universal/$APP_NAME"
 fi
 
 echo "==> Packaging into $APP_BUNDLE..."
