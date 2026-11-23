@@ -201,13 +201,15 @@ impl JobQueue {
     pub fn clear_finished(&self) -> Vec<StitchJobSnapshot> {
         let remaining = {
             let mut guard = self.state.lock().expect("queue state poisoned");
-            guard.order.retain(|id| {
-                guard
-                    .jobs
-                    .get(id)
-                    .map(|j| !j.snapshot.status.is_terminal())
-                    .unwrap_or(false)
-            });
+            let mut active_order = Vec::new();
+            for id in &guard.order {
+                if let Some(j) = guard.jobs.get(id) {
+                    if !j.snapshot.status.is_terminal() {
+                        active_order.push(id.clone());
+                    }
+                }
+            }
+            guard.order = active_order;
             let active_ids: std::collections::HashSet<String> =
                 guard.order.iter().cloned().collect();
             guard.jobs.retain(|id, _| active_ids.contains(id));

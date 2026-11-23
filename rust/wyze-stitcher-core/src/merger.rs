@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,7 @@ pub fn merge_mp4_lossless<F>(
     input_clips: &[PathBuf],
     temp_output: &Path,
     cancel_flag: &Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<(), StitcherError>
 where
     F: FnMut(f32, u32, Option<String>),
@@ -51,24 +52,29 @@ where
         })
         .collect();
 
-    let mut last_emitted_progress: f32 = -1.0;
-    let mut last_emitted_at = Instant::now() - Duration::from_secs(1);
+    let last_emitted_progress = Cell::new(-1.0f32);
+    let last_emitted_at = Cell::new(Instant::now() - Duration::from_secs(1));
+    let on_progress = RefCell::new(on_progress);
 
-    let merge_result = mp4_merge::join_files(input_clips, temp_output, |raw_progress: f32| {
+    let temp_output_buf = temp_output.to_path_buf();
+    let merge_result = mp4_merge::join_files(input_clips, &temp_output_buf, |raw_progress: f64| {
+        let raw_progress = raw_progress as f32;
         let clamped = raw_progress.clamp(0.0, 1.0);
         let now = Instant::now();
-        let should_emit = (clamped - last_emitted_progress).abs() >= 0.015
-            || now.duration_since(last_emitted_at) >= Duration::from_millis(80)
+        let prev_progress = last_emitted_progress.get();
+        let prev_at = last_emitted_at.get();
+        let should_emit = (clamped - prev_progress).abs() >= 0.015
+            || now.duration_since(prev_at) >= Duration::from_millis(80)
             || clamped >= 1.0;
 
         if should_emit {
-            last_emitted_progress = clamped;
-            last_emitted_at = now;
+            last_emitted_progress.set(clamped);
+            last_emitted_at.set(now);
 
             let idx = ((clamped * total_clips as f32).floor() as usize)
                 .min(clip_names.len().saturating_sub(1));
             let processed = ((clamped * total_clips as f32).round() as u32).min(total_clips);
-            on_progress(clamped, processed, clip_names.get(idx).cloned());
+            (on_progress.borrow_mut())(clamped, processed, clip_names.get(idx).cloned());
         }
     });
 
