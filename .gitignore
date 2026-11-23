@@ -32,3 +32,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Internal agent files & memory
+AGENTS.md
+CLAUDE.md
+.agents/
+.brain/
+scratch/
+
