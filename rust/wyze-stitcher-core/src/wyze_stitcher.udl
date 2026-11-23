@@ -1,0 +1,166 @@
+namespace wyze_stitcher {
+    /// Returns the crate version string for diagnostics and the About window.
+    string core_version();
+
+    /// Formats a preview output filename for Settings UI:
+    /// - TwentyFourHour:   "2026-05-29_0000.mp4"
+    /// - TwelveHourLegacy: "2026-05-29_!12AM.mp4" / "2026-05-29_1PM.mp4"
+    string preview_output_filename(string day, string hour, OutputNamingFormat format);
+};
+
+/// Configurable output file naming convention.
+enum OutputNamingFormat {
+    /// Default: YYYY-MM-DD_HH00.mp4 (chronologically sortable 24-hour format).
+    "TwentyFourHour",
+    /// Legacy web-app format: YYYY-MM-DD_hAM.mp4 with !12AM prefix for midnight.
+    "TwelveHourLegacy",
+};
+
+/// Visual footage density tier for the 24-hour heatmap and hour tile badges.
+enum FootageDensity {
+    "Empty",
+    "SevereGaps",
+    "MinorGaps",
+    "Complete",
+};
+
+/// Lifecycle state of an individual hourly stitching job.
+enum JobStatus {
+    "Pending",
+    "Running",
+    "RemuxingFallback",
+    "Completed",
+    "Failed",
+    "Cancelled",
+};
+
+/// Typed errors bridged to native Swift Error enums.
+[Error]
+interface StitcherError {
+    InvalidDirectory(string path);
+    IoError(string message);
+    NoClipsFound(string hour_path);
+    Mp4MergeFailed(string reason);
+    FallbackRemuxFailed(string reason);
+    JobNotFound(string job_id);
+    Cancelled();
+};
+
+/// Metadata for a single hour folder (/record/YYYYMMDD/HH).
+dictionary HourRecord {
+    string hour;
+    u32 clip_count;
+    sequence<string> clips;
+    sequence<string> missing_minutes;
+    FootageDensity density;
+    boolean has_non_aac_audio;
+};
+
+/// Metadata for a single day folder (/record/YYYYMMDD).
+dictionary DayRecord {
+    string day;
+    string formatted_day;
+    sequence<HourRecord> hours;
+};
+
+/// Result from a multi-threaded Rayon directory scan.
+dictionary ScanResult {
+    string source_dir;
+    sequence<DayRecord> days;
+    u32 total_days;
+    u32 total_hours;
+    u32 total_clips;
+    u64 scan_duration_ms;
+};
+
+/// Global execution options applied when enqueueing a batch of hourly jobs.
+dictionary StitchOptions {
+    string source_dir;
+    string? custom_output_dir;
+    boolean use_same_folder;
+    boolean overwrite;
+    boolean delete_after_compile;
+    OutputNamingFormat naming_format;
+};
+
+/// Request for a single hourly job (full hour or custom minute subset from Inspector).
+dictionary StitchJobRequest {
+    string day;
+    string hour;
+    sequence<string>? selected_clips;
+};
+
+/// Immutable snapshot of a job's state for UI rendering.
+dictionary StitchJobSnapshot {
+    string id;
+    string day;
+    string hour;
+    JobStatus status;
+    u32 total_clips;
+    u32 processed_clips;
+    f32 progress;
+    string? current_clip_name;
+    string? output_path;
+    u64 file_size_bytes;
+    u64 duration_ms;
+    boolean used_audio_fallback;
+    string? error_message;
+    sequence<string> logs;
+};
+
+/// High-frequency progress payload pushed from Rust to Swift during active merging.
+dictionary JobProgressEvent {
+    string job_id;
+    JobStatus status;
+    f32 progress;
+    u32 processed_clips;
+    u32 total_clips;
+    string? current_clip_name;
+};
+
+/// Push notification observer implemented in Swift (StitcherStore).
+[Trait, WithForeign]
+interface StitchEventListener {
+    void on_job_updated(StitchJobSnapshot snapshot);
+    void on_job_progress(JobProgressEvent event);
+    void on_job_log(string job_id, string line, boolean is_error);
+    void on_queue_idle();
+};
+
+/// Foreign async audio remux fallback implemented in Swift using AVFoundation.
+/// Invoked when a camera hour uses legacy non-AAC audio (e.g. ulaw) or mp4-merge fails.
+[Trait, WithForeign]
+interface AudioRemuxFallback {
+    [Async, Throws=StitcherError]
+    void remux_clips_to_aac(
+        string job_id,
+        sequence<string> input_clip_paths,
+        string temp_output_path
+    );
+};
+
+/// Primary stateful Rust engine held by StitcherStore in Swift.
+interface StitcherEngine {
+    constructor(StitchEventListener listener, AudioRemuxFallback remux_fallback);
+
+    /// Scans /record/YYYYMMDD/HH/MM.mp4 in parallel using Rayon on a background thread.
+    [Async, Throws=StitcherError]
+    ScanResult scan_directory(string source_dir);
+
+    /// Validates options and appends jobs to the sequential background Tokio queue.
+    [Throws=StitcherError]
+    sequence<StitchJobSnapshot> enqueue_jobs(
+        StitchOptions options,
+        sequence<StitchJobRequest> requests
+    );
+
+    /// Cancels a pending job immediately or signals abort on the active job.
+    [Throws=StitcherError]
+    StitchJobSnapshot cancel_job(string job_id);
+
+    /// Returns all current and historical jobs in insertion order.
+    sequence<StitchJobSnapshot> get_jobs();
+
+    /// Clears Completed, Failed, and Cancelled jobs while preserving Pending/Running jobs.
+    sequence<StitchJobSnapshot> clear_finished_jobs();
+};

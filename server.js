@@ -14,7 +14,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Global queue state
 let stitchingJobs = [];
@@ -554,7 +554,33 @@ app.get('/api/video-stream', (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`[Stitcher Server] API server running on http://localhost:${PORT}`);
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        allowedHosts: true
+      },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve('dist');
+    app.use(express.static(distPath));
+    app.use((req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Stitcher Server] Running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('[Stitcher Server] Failed to start:', err);
+  process.exit(1);
 });
 
