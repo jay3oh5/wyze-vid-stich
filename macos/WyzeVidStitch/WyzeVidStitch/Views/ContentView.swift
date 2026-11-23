@@ -1,9 +1,12 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import WyzeStitcherKit
 
 struct ContentView: View {
     @EnvironmentObject private var settings: AppSettings
     @Environment(StitcherStore.self) private var store
+
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         @Bindable var bindableStore = store
@@ -12,8 +15,22 @@ struct ContentView: View {
             DaySidebarView()
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
         } detail: {
-            detailContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                if let card = store.detectedSDCard {
+                    sdCardBanner(card)
+                    Divider()
+                }
+                detailContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .overlay {
+            if isDropTargeted {
+                dropTargetOverlay
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleFileDrop(providers)
         }
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
@@ -39,16 +56,27 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    store.requestStitchSelectedHours()
-                } label: {
-                    Label(
-                        "Stitch Selected (\(store.selectedHours.count))",
-                        systemImage: "play.fill"
-                    )
+                HStack(spacing: 8) {
+                    if !store.selectedHours.isEmpty {
+                        let estBytes = store.estimatedSelectedBytes()
+                        if estBytes > 0 {
+                            Text("~\(StitcherStore.formatBytes(estBytes))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Button {
+                        store.requestStitchSelectedHours()
+                    } label: {
+                        Label(
+                            "Stitch Selected (\(store.selectedHours.count))",
+                            systemImage: "play.fill"
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(store.selectedHours.isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(store.selectedHours.isEmpty)
             }
         }
         .sheet(item: $bindableStore.inspectingTarget) { target in
@@ -77,7 +105,7 @@ struct ContentView: View {
             )
         }
         .alert(
-            "Stitcher Error",
+            "Stitcher Notice",
             isPresented: Binding(
                 get: { store.errorBanner != nil },
                 set: { if !$0 { store.errorBanner = nil } }
@@ -94,6 +122,87 @@ struct ContentView: View {
                 NotificationService.requestAuthorization()
             }
         }
+    }
+
+    private func sdCardBanner(_ card: DetectedSDCard) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sdcard.fill")
+                .foregroundStyle(Color.accentColor)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Wyze SD Card Detected: \(card.volumeName)")
+                    .font(.subheadline.weight(.semibold))
+                Text(card.recordPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            Button("Scan SD Card") {
+                store.scanDetectedSDCard()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+
+            Button {
+                store.dismissSDCardBanner()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.1))
+    }
+
+    private var dropTargetOverlay: some View {
+        ZStack {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2.5, dash: [8, 6]))
+                .padding(20)
+            VStack(spacing: 10) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 42))
+                    .foregroundStyle(Color.accentColor)
+                Text("Drop Wyze Record Folder or SD Card")
+                    .font(.title3.weight(.semibold))
+                Text("Release to scan footage density and gaps automatically")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            return false
+        }
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            let resolvedURL: URL?
+            if let data = item as? Data {
+                resolvedURL = URL(dataRepresentation: data, relativeTo: nil)
+            } else if let url = item as? URL {
+                resolvedURL = url
+            } else {
+                resolvedURL = nil
+            }
+            if let url = resolvedURL {
+                Task { @MainActor in
+                    store.handleDroppedFolderURL(url)
+                }
+            }
+        }
+        return true
     }
 
     @ViewBuilder
@@ -126,7 +235,7 @@ struct ContentView: View {
                 } description: {
                     Text(
                         settings.sourceDir.isEmpty
-                            ? "Select your Wyze camera's /record folder to scan footage density and missing minute gaps."
+                            ? "Select or drop your Wyze camera's /record folder onto this window to scan footage density and missing minute gaps."
                             : "Ready to scan \(settings.sourceDir)."
                     )
                 } actions: {

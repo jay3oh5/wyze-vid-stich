@@ -2,6 +2,13 @@ import AVFoundation
 import Foundation
 import WyzeStitcherKit
 
+/// Thread-safe handle tracking an active AVFoundation fallback session for instant cancellation.
+private final class ActiveRemuxSession {
+    var isCancelled: Bool = false
+    weak var reader: AVAssetReader?
+    weak var writer: AVAssetWriter?
+}
+
 /// Native Apple AVFoundation fallback implementing UniFFI's `AudioRemuxFallback` foreign trait.
 /// Used automatically when legacy Wyze cameras emit non-AAC audio (e.g. μ-law PCM) or when
 /// container-level `mp4-merge` reports a track incompatibility.
@@ -12,11 +19,44 @@ import WyzeStitcherKit
 ///    into `AVAssetWriterInput(outputSettings: nil)` (zero video transcoding).
 /// 3. Decode legacy audio to Linear PCM and encode to standard 48kHz AAC-LC (`kAudioFormatMPEG4AAC`)
 ///    for universal QuickTime and `AVPlayerView` playback compatibility.
+/// 4. Support instant cooperative abort via `cancelRemux(jobId:)`.
 final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
     private let onProgress: @Sendable (String, Float, UInt32, UInt32, String?) -> Void
+    private let lock = NSLock()
+    private var sessions: [String: ActiveRemuxSession] = [:]
 
     init(onProgress: @escaping @Sendable (String, Float, UInt32, UInt32, String?) -> Void) {
         self.onProgress = onProgress
+    }
+
+    func cancelRemux(jobId: String) {
+        let session: ActiveRemuxSession? = lock.withLock {
+            let s = sessions[jobId]
+            s?.isCancelled = true
+            return s
+        }
+        session?.reader?.cancelReading()
+        session?.writer?.cancelWriting()
+    }
+
+    private func registerSession(for jobId: String) -> ActiveRemuxSession {
+        lock.withLock {
+            let session = ActiveRemuxSession()
+            sessions[jobId] = session
+            return session
+        }
+    }
+
+    private func unregisterSession(for jobId: String) {
+        lock.withLock {
+            _ = sessions.removeValue(forKey: jobId)
+        }
+    }
+
+    private func isCancelled(_ jobId: String) -> Bool {
+        lock.withLock {
+            sessions[jobId]?.isCancelled ?? false
+        }
     }
 
     func remuxClipsToAac(
@@ -27,6 +67,9 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
         guard !inputClipPaths.isEmpty else {
             throw StitcherError.FallbackRemuxFailed(reason: "No clips provided to AVFoundation remuxer.")
         }
+
+        let session = registerSession(for: jobId)
+        defer { unregisterSession(for: jobId) }
 
         let composition = AVMutableComposition()
         guard let compVideoTrack = composition.addMutableTrack(
@@ -46,11 +89,20 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
         var hasAudio = false
 
         for (index, clipPath) in inputClipPaths.enumerated() {
-            try Task.checkCancellation()
+            if isCancelled(jobId) || Task.isCancelled {
+                throw StitcherError.Cancelled
+            }
+
             let url = URL(fileURLWithPath: clipPath)
             let asset = AVURLAsset(url: url)
 
             let duration = try await asset.load(.duration)
+            guard duration.isValid && duration > .zero else {
+                throw StitcherError.FallbackRemuxFailed(
+                    reason: "Corrupt or zero-duration clip detected: \(url.lastPathComponent). Inspect and exclude this minute to continue."
+                )
+            }
+
             let timeRange = CMTimeRange(start: .zero, duration: duration)
 
             if let srcVideo = try await asset.loadTracks(withMediaType: .video).first {
@@ -64,9 +116,12 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
 
             cursor = CMTimeAdd(cursor, duration)
 
-            // Phase 1 (0%..35%): assembling composition timeline.
             let composeProgress = Float(index + 1) / Float(inputClipPaths.count) * 0.35
             onProgress(jobId, composeProgress, UInt32(index + 1), totalClips, url.lastPathComponent)
+        }
+
+        if isCancelled(jobId) || Task.isCancelled {
+            throw StitcherError.Cancelled
         }
 
         let outputURL = URL(fileURLWithPath: tempOutputPath)
@@ -80,6 +135,11 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
             writer.shouldOptimizeForNetworkUse = true
         } catch {
             throw StitcherError.FallbackRemuxFailed(reason: error.localizedDescription)
+        }
+
+        lock.withLock {
+            session.reader = reader
+            session.writer = writer
         }
 
         // Video passthrough (lossless stream copy — outputSettings: nil).
@@ -146,8 +206,15 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
             let audioQueue = DispatchQueue(label: "com.wyzevidstitch.avfoundation.audio")
 
             group.enter()
+            var videoFinished = false
             videoInput.requestMediaDataWhenReady(on: videoQueue) {
-                while videoInput.isReadyForMoreMediaData {
+                while !videoFinished && videoInput.isReadyForMoreMediaData {
+                    if self.isCancelled(jobId) {
+                        videoFinished = true
+                        videoInput.markAsFinished()
+                        group.leave()
+                        return
+                    }
                     if let sampleBuffer = videoOutput.copyNextSampleBuffer() {
                         let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
                         if pts.isFinite {
@@ -156,11 +223,13 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
                             progressCallback(jobId, overall, totalClips, totalClips, "Remuxing AAC Audio...")
                         }
                         if !videoInput.append(sampleBuffer) {
+                            videoFinished = true
                             videoInput.markAsFinished()
                             group.leave()
                             return
                         }
                     } else {
+                        videoFinished = true
                         videoInput.markAsFinished()
                         group.leave()
                         return
@@ -170,15 +239,24 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
 
             if let (audioOutput, audioInput) = audioPair {
                 group.enter()
+                var audioFinished = false
                 audioInput.requestMediaDataWhenReady(on: audioQueue) {
-                    while audioInput.isReadyForMoreMediaData {
+                    while !audioFinished && audioInput.isReadyForMoreMediaData {
+                        if self.isCancelled(jobId) {
+                            audioFinished = true
+                            audioInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
                         if let sampleBuffer = audioOutput.copyNextSampleBuffer() {
                             if !audioInput.append(sampleBuffer) {
+                                audioFinished = true
                                 audioInput.markAsFinished()
                                 group.leave()
                                 return
                             }
                         } else {
+                            audioFinished = true
                             audioInput.markAsFinished()
                             group.leave()
                             return
@@ -188,8 +266,18 @@ final class AVFoundationRemuxer: AudioRemuxFallback, @unchecked Sendable {
             }
 
             group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+                if self.isCancelled(jobId) || writer.status == .cancelled {
+                    writer.cancelWriting()
+                    try? FileManager.default.removeItem(at: outputURL)
+                    continuation.resume(throwing: StitcherError.Cancelled)
+                    return
+                }
+
                 writer.finishWriting {
-                    if writer.status == .completed {
+                    if self.isCancelled(jobId) || writer.status == .cancelled {
+                        try? FileManager.default.removeItem(at: outputURL)
+                        continuation.resume(throwing: StitcherError.Cancelled)
+                    } else if writer.status == .completed {
                         progressCallback(jobId, 1.0, totalClips, totalClips, nil)
                         continuation.resume()
                     } else {

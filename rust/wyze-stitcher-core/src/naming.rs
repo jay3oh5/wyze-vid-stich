@@ -9,7 +9,7 @@ pub fn format_day_display(day: &str) -> String {
     }
 }
 
-/// Formats the compiled output filename according to the user's Settings preference:
+/// Formats the compiled single-hour output filename according to Settings:
 /// - `TwentyFourHour` (default): `2026-05-29_0000.mp4`, `2026-05-29_1400.mp4`
 /// - `TwelveHourLegacy`: `2026-05-29_!12AM.mp4`, `2026-05-29_2PM.mp4`
 pub fn format_output_filename(day: &str, hour: &str, format: OutputNamingFormat) -> String {
@@ -35,6 +35,12 @@ pub fn format_output_filename(day: &str, hour: &str, format: OutputNamingFormat)
             format!("{formatted_date}_{hour_part}.mp4")
         }
     }
+}
+
+/// Formats the compiled output filename for Full-Day / Multi-Hour merged outputs.
+pub fn format_full_day_filename(day: &str) -> String {
+    let formatted_date = format_day_display(day);
+    format!("{formatted_date}_FullDay.mp4")
 }
 
 #[cfg(test)]
@@ -66,6 +72,14 @@ mod tests {
         assert_eq!(
             format_output_filename("20260529", "17", OutputNamingFormat::TwelveHourLegacy),
             "2026-05-29_5PM.mp4"
+        );
+    }
+
+    #[test]
+    fn formats_full_day_filename() {
+        assert_eq!(
+            format_full_day_filename("20260529"),
+            "2026-05-29_FullDay.mp4"
         );
     }
 }

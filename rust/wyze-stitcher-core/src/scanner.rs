@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::naming::format_day_display;
 /// - Single day folder (e.g. `.../20241020` containing `HH/MM.mp4`)
 /// - SD card root containing a `record` folder
 /// - Standard Wyze directory: `<source_dir>/YYYYMMDD/HH/MM.mp4`
-/// - Parent folder containing hour subfolders
+/// - Multi-folder parent directories (aggregates all matching immediate subdirectories)
 pub fn scan_record_directory(source_dir: &str) -> Result<ScanResult, StitcherError> {
     let started = Instant::now();
     let root = PathBuf::from(source_dir);
@@ -72,7 +72,7 @@ fn discover_and_scan_hierarchy(root: &Path) -> Result<Vec<DayRecord>, StitcherEr
         }
     }
 
-    // Case 3: The directory contains hour subfolders directly (e.g. ".../20241020" or user folder with "11", "12", etc.)
+    // Case 3: The directory contains hour subfolders directly (e.g. ".../20241020" or user folder with "11", "12")
     let mut hour_entries = Vec::new();
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
@@ -91,10 +91,11 @@ fn discover_and_scan_hierarchy(root: &Path) -> Result<Vec<DayRecord>, StitcherEr
     if !hour_entries.is_empty() {
         hour_entries.sort_by(|a, b| a.0.cmp(&b.0));
         let day = get_day_for_folder(root);
-        let hours: Vec<HourRecord> = hour_entries
+        let mut hours: Vec<HourRecord> = hour_entries
             .into_par_iter()
             .map(|(hour, hour_path)| scan_hour_folder(hour, &hour_path))
             .collect::<Result<Vec<_>, _>>()?;
+        hours.sort_by(|a, b| a.hour.cmp(&b.hour));
         let formatted_day = format_day_display(&day);
         return Ok(vec![DayRecord {
             day,
@@ -132,20 +133,56 @@ fn discover_and_scan_hierarchy(root: &Path) -> Result<Vec<DayRecord>, StitcherEr
         }
     }
 
-    // Case 5: Shallow inspection of immediate subdirectories
+    // Case 5: Shallow inspection across ALL immediate non-hidden subdirectories (aggregates multi-folder trees)
+    let mut subdirs: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(root) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !name.starts_with('.') && !name.starts_with('$') {
-                    if let Ok(sub_days) = discover_and_scan_hierarchy(&p) {
-                        if !sub_days.is_empty() {
-                            return Ok(sub_days);
-                        }
-                    }
+                    subdirs.push(p);
                 }
             }
+        }
+    }
+    subdirs.sort();
+
+    let mut aggregated: BTreeMap<String, Vec<HourRecord>> = BTreeMap::new();
+    for subdir in subdirs {
+        if let Ok(sub_days) = discover_and_scan_hierarchy(&subdir) {
+            for day_rec in sub_days {
+                aggregated
+                    .entry(day_rec.day)
+                    .or_default()
+                    .extend(day_rec.hours);
+            }
+        }
+    }
+
+    if !aggregated.is_empty() {
+        let merged_days: Vec<DayRecord> = aggregated
+            .into_iter()
+            .map(|(day, mut hours)| {
+                let mut seen = HashSet::new();
+                hours.retain(|h| seen.insert((h.hour.clone(), h.source_dir_path.clone())));
+                hours.sort_by(|a, b| {
+                    a.hour
+                        .cmp(&b.hour)
+                        .then_with(|| a.source_dir_path.cmp(&b.source_dir_path))
+                });
+                let formatted_day = format_day_display(&day);
+                DayRecord {
+                    day,
+                    formatted_day,
+                    hours,
+                }
+            })
+            .filter(|d| !d.hours.is_empty())
+            .collect();
+
+        if !merged_days.is_empty() {
+            return Ok(merged_days);
         }
     }
 
@@ -189,6 +226,7 @@ fn scan_day_folder(day: String, day_path: &Path) -> Result<DayRecord, StitcherEr
 fn scan_hour_folder(hour: String, hour_path: &Path) -> Result<HourRecord, StitcherError> {
     let mut present_minutes = HashSet::with_capacity(60);
     let mut clips: Vec<String> = Vec::with_capacity(60);
+    let mut total_size_bytes: u64 = 0;
 
     for entry in fs::read_dir(hour_path)?.flatten() {
         let name = match entry.file_name().into_string() {
@@ -197,6 +235,9 @@ fn scan_hour_folder(hour: String, hour_path: &Path) -> Result<HourRecord, Stitch
         };
         if let Some(min_str) = parse_minute_clip_name(&name) {
             present_minutes.insert(min_str.to_string());
+            if let Ok(meta) = entry.metadata() {
+                total_size_bytes = total_size_bytes.saturating_add(meta.len());
+            }
             clips.push(name);
         }
     }
@@ -221,7 +262,9 @@ fn scan_hour_folder(hour: String, hour_path: &Path) -> Result<HourRecord, Stitch
 
     Ok(HourRecord {
         hour,
+        source_dir_path: hour_path.to_string_lossy().to_string(),
         clip_count,
+        total_size_bytes,
         clips,
         missing_minutes,
         density,
@@ -254,13 +297,11 @@ pub fn extract_hour_from_name(name: &str) -> Option<String> {
 }
 
 fn get_day_for_folder(dir: &Path) -> String {
-    // 1. Folder name is 8-digit date
     if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
         if is_valid_day_dir(name) {
             return name.to_string();
         }
     }
-    // 2. Parent folder name is 8-digit date
     if let Some(parent) = dir.parent() {
         if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
             if is_valid_day_dir(name) {
@@ -268,11 +309,9 @@ fn get_day_for_folder(dir: &Path) -> String {
             }
         }
     }
-    // 3. Inspect modified date of the clips
     if let Some(date_str) = find_clip_mtime_date(dir) {
         return date_str;
     }
-    // 4. Default to today
     chrono::Local::now().format("%Y%m%d").to_string()
 }
 
@@ -333,9 +372,7 @@ fn parse_minute_clip_name(name: &str) -> Option<&str> {
 
 /// Fast zero-decode MP4 box header sniffer that inspects the `moov` atom for
 /// legacy non-AAC audio codecs commonly emitted by older Wyze v2/v3 cameras
-/// (`ulaw`, `alaw`, `twos`, `sowt`, `lpcm`, `raw `).
-/// Returns `true` if a legacy non-AAC audio sample entry is detected so the
-/// queue can seamlessly route the hour through the AVFoundation AAC remux fallback.
+/// (`ulaw`, `alaw`, `twos`, `sowt`, `lpcm`).
 pub fn detect_non_aac_audio(mp4_path: &Path) -> bool {
     let Ok(mut file) = File::open(mp4_path) else {
         return false;
@@ -345,7 +382,6 @@ pub fn detect_non_aac_audio(mp4_path: &Path) -> bool {
         return false;
     };
 
-    // Walk top-level ISO-BMFF boxes to locate `moov` without reading media payloads (`mdat`).
     let mut offset: u64 = 0;
     let mut header = [0u8; 8];
 
@@ -377,7 +413,6 @@ pub fn detect_non_aac_audio(mp4_path: &Path) -> bool {
         }
 
         if box_type == b"moov" {
-            // Cap read at 2 MiB to keep scanning instant even on unusually large metadata boxes.
             let read_len = (box_size as usize).min(2 * 1024 * 1024);
             let mut moov_bytes = vec![0u8; read_len];
             if file.seek(SeekFrom::Start(offset)).is_ok()
@@ -396,19 +431,16 @@ pub fn detect_non_aac_audio(mp4_path: &Path) -> bool {
 
 fn contains_non_aac_audio_fourcc(moov_bytes: &[u8]) -> bool {
     const LEGACY_AUDIO_FOURCCS: &[[u8; 4]] = &[
-        *b"ulaw", // μ-law PCM (common on Wyze Cam v2 / v3)
-        *b"alaw", // A-law PCM
-        *b"twos", // Uncompressed big-endian PCM
-        *b"sowt", // Uncompressed little-endian PCM
-        *b"lpcm", // Linear PCM
+        *b"ulaw",
+        *b"alaw",
+        *b"twos",
+        *b"sowt",
+        *b"lpcm",
     ];
 
-    // Look for `stsd` sample description boxes followed by a legacy audio FourCC.
     let mut i = 0;
     while i + 24 <= moov_bytes.len() {
         if &moov_bytes[i..i + 4] == b"stsd" {
-            // stsd layout: [4 bytes "stsd"][4 bytes version+flags][4 bytes entry_count]
-            //              [4 bytes entry_size][4 bytes format_fourcc]
             let fourcc = &moov_bytes[i + 16..i + 20];
             if LEGACY_AUDIO_FOURCCS.iter().any(|c| c == fourcc) {
                 return true;
@@ -433,9 +465,8 @@ mod tests {
         fs::create_dir_all(&hour_dir).unwrap();
 
         for m in [0, 1, 2, 5] {
-            fs::write(hour_dir.join(format!("{m:02}.mp4")), b"stub").unwrap();
+            fs::write(hour_dir.join(format!("{m:02}.mp4")), b"stubdata").unwrap();
         }
-        // Non-minute file should be ignored
         fs::write(hour_dir.join("notes.txt"), b"ignore").unwrap();
 
         let result = scan_record_directory(dir.path().to_str().unwrap()).unwrap();
@@ -444,6 +475,11 @@ mod tests {
         assert_eq!(result.total_clips, 4);
         assert_eq!(result.days[0].formatted_day, "2026-05-29");
         assert_eq!(result.days[0].hours[0].density, FootageDensity::SevereGaps);
+        assert_eq!(result.days[0].hours[0].total_size_bytes, 32);
+        assert_eq!(
+            result.days[0].hours[0].source_dir_path,
+            hour_dir.to_string_lossy()
+        );
         assert_eq!(result.days[0].hours[0].missing_minutes.len(), 56);
         assert!(result.days[0].hours[0].missing_minutes.contains(&"03".to_string()));
     }
@@ -502,5 +538,22 @@ mod tests {
         assert_eq!(result.total_clips, 10);
         assert_eq!(result.days[0].day, "20241020");
         assert_eq!(result.days[0].hours[0].hour, "09");
+    }
+
+    #[test]
+    fn aggregates_multiple_subdirectories_in_shallow_scan() {
+        let dir = tempdir().unwrap();
+        let cam_a = dir.path().join("FrontYard").join("20260529").join("08");
+        let cam_b = dir.path().join("BackYard").join("20260530").join("09");
+        fs::create_dir_all(&cam_a).unwrap();
+        fs::create_dir_all(&cam_b).unwrap();
+
+        fs::write(cam_a.join("00.mp4"), b"aaaa").unwrap();
+        fs::write(cam_b.join("01.mp4"), b"bbbb").unwrap();
+
+        let result = scan_record_directory(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(result.total_days, 2);
+        assert_eq!(result.total_hours, 2);
+        assert_eq!(result.total_clips, 2);
     }
 }

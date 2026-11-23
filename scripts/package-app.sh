@@ -8,6 +8,7 @@ MACOS_DIR="$ROOT_DIR/macos/WyzeVidStitch"
 DIST_DIR="$ROOT_DIR/dist"
 APP_NAME="WyzeVidStitch"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
+DMG_STAGE="$DIST_DIR/.dmg-stage"
 
 echo "==> Building WyzeVidStitch via Swift Package Manager (Universal2)..."
 cd "$MACOS_DIR"
@@ -33,6 +34,11 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$BIN_PATH" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$MACOS_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
+if [ -f "$ROOT_DIR/scripts/generate-icon.sh" ]; then
+    chmod +x "$ROOT_DIR/scripts/generate-icon.sh"
+    "$ROOT_DIR/scripts/generate-icon.sh" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
 if [ -f "$MACOS_DIR/WyzeVidStitch/WyzeVidStitch.entitlements" ]; then
     echo "==> Applying entitlements & ad-hoc codesigning..."
     codesign --force --deep --sign - --entitlements "$MACOS_DIR/WyzeVidStitch/WyzeVidStitch.entitlements" "$APP_BUNDLE"
@@ -43,10 +49,23 @@ fi
 echo "==> Creating ZIP archive..."
 mkdir -p "$DIST_DIR"
 cd "$DIST_DIR"
+rm -f "$APP_NAME-macOS.zip"
 zip -r "$APP_NAME-macOS.zip" "$APP_NAME.app"
 
-echo "==> Creating DMG image..."
-hdiutil create -volname "$APP_NAME" -srcfolder "$APP_BUNDLE" -ov -format UDZO "$APP_NAME-macOS.dmg"
+echo "==> Creating drag-to-Applications DMG image..."
+rm -rf "$DMG_STAGE"
+mkdir -p "$DMG_STAGE"
+cp -R "$APP_BUNDLE" "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+
+hdiutil create \
+    -volname "Wyze Vid Stitch" \
+    -srcfolder "$DMG_STAGE" \
+    -ov \
+    -format UDZO \
+    "$APP_NAME-macOS.dmg"
+
+rm -rf "$DMG_STAGE"
 
 echo "==> Successfully packaged:"
 echo "    App: $APP_BUNDLE"

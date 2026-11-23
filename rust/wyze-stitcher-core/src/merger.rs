@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,82 @@ use crate::error::StitcherError;
 pub fn temp_staging_path(final_output: &Path, job_id: &str) -> PathBuf {
     let parent = final_output.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".stitch_{job_id}.tmp.mp4"))
+}
+
+/// Strictly validates every input clip before stitching (fail-fast policy).
+/// Detects missing files, 0-byte clips, and truncated/invalid MP4 container headers,
+/// returning an actionable error identifying the exact clip filename.
+pub fn validate_clips_strict(input_clips: &[PathBuf]) -> Result<(), StitcherError> {
+    const VALID_TOP_BOXES: &[[u8; 4]] = &[
+        *b"ftyp",
+        *b"moov",
+        *b"mdat",
+        *b"free",
+        *b"skip",
+        *b"wide",
+        *b"uuid",
+        *b"pdin",
+    ];
+
+    for path in input_clips {
+        let display_label = format_clip_label(path);
+        let meta = fs::metadata(path).map_err(|err| StitcherError::Mp4MergeFailed {
+            reason: format!("Unreadable clip '{display_label}': {err}"),
+        })?;
+
+        if meta.len() == 0 {
+            return Err(StitcherError::Mp4MergeFailed {
+                reason: format!(
+                    "Corrupt or empty clip detected: {display_label} (0 bytes). Inspect and exclude this minute to continue."
+                ),
+            });
+        }
+
+        if meta.len() < 8 {
+            return Err(StitcherError::Mp4MergeFailed {
+                reason: format!(
+                    "Truncated MP4 clip detected: {display_label} ({} bytes). Inspect and exclude this minute to continue.",
+                    meta.len()
+                ),
+            });
+        }
+
+        let mut file = File::open(path).map_err(|err| StitcherError::Mp4MergeFailed {
+            reason: format!("Could not open clip '{display_label}': {err}"),
+        })?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)
+            .map_err(|err| StitcherError::Mp4MergeFailed {
+                reason: format!("Corrupt MP4 header in '{display_label}': {err}"),
+            })?;
+
+        let box_size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let box_type = &header[4..8];
+        let valid_size = box_size == 0 || box_size == 1 || box_size >= 8;
+        let valid_type = VALID_TOP_BOXES.iter().any(|t| t == box_type);
+
+        if !valid_size || !valid_type {
+            return Err(StitcherError::Mp4MergeFailed {
+                reason: format!(
+                    "Invalid MP4 container header in '{display_label}'. Inspect and exclude this minute to continue."
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn format_clip_label(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+    if let Some(parent_name) = path.parent().and_then(|p| p.file_name()) {
+        format!("{}/{}", parent_name.to_string_lossy(), filename)
+    } else {
+        filename
+    }
 }
 
 /// Runs container-level lossless MP4 concatenation using `mp4_merge::join_files`.
@@ -45,11 +122,7 @@ where
     let total_clips = input_clips.len() as u32;
     let clip_names: Vec<String> = input_clips
         .iter()
-        .map(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "clip.mp4".to_string())
-        })
+        .map(|p| format_clip_label(p))
         .collect();
 
     let last_emitted_progress = Cell::new(-1.0f32);
@@ -114,4 +187,46 @@ pub fn finalize_staged_output(temp_output: &Path, final_output: &Path) -> Result
 
     fs::rename(temp_output, final_output)?;
     Ok(metadata.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn strict_validation_fails_fast_on_zero_byte_clip() {
+        let dir = tempdir().unwrap();
+        let bad_clip = dir.path().join("14.mp4");
+        fs::write(&bad_clip, b"").unwrap();
+
+        let err = validate_clips_strict(&[bad_clip]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("14.mp4"));
+        assert!(msg.contains("0 bytes"));
+    }
+
+    #[test]
+    fn strict_validation_fails_fast_on_invalid_header() {
+        let dir = tempdir().unwrap();
+        let bad_clip = dir.path().join("22.mp4");
+        fs::write(&bad_clip, b"NOT_AN_MP4_FILE_HEADER").unwrap();
+
+        let err = validate_clips_strict(&[bad_clip]).unwrap_err();
+        assert!(err.to_string().contains("22.mp4"));
+    }
+
+    #[test]
+    fn strict_validation_accepts_valid_ftyp_box() {
+        let dir = tempdir().unwrap();
+        let good_clip = dir.path().join("00.mp4");
+        // Valid 16-byte ISO-BMFF ftyp header
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom\0\0\0\0");
+        fs::write(&good_clip, &bytes).unwrap();
+
+        assert!(validate_clips_strict(&[good_clip]).is_ok());
+    }
 }

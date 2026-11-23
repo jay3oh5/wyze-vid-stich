@@ -13,7 +13,7 @@ pub use crate::error::StitcherError;
 pub use crate::models::{
     AudioRemuxFallback, DayRecord, FootageDensity, HourRecord, JobProgressEvent, JobStatus,
     OutputNamingFormat, ScanResult, StitchEventListener, StitchJobRequest, StitchJobSnapshot,
-    StitchOptions,
+    StitchMode, StitchOptions,
 };
 use crate::queue::JobQueue;
 
@@ -24,9 +24,14 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-/// Formats a preview output filename for Settings UI.
+/// Formats a preview single-hour output filename for Settings UI.
 pub fn preview_output_filename(day: String, hour: String, format: OutputNamingFormat) -> String {
     naming::format_output_filename(&day, &hour, format)
+}
+
+/// Formats a preview full-day output filename.
+pub fn preview_full_day_filename(day: String) -> String {
+    naming::format_full_day_filename(&day)
 }
 
 /// Primary UniFFI-exported engine coordinating parallel scanning and sequential stitching.
@@ -63,7 +68,7 @@ impl StitcherEngine {
         })?
     }
 
-    /// Validates options and appends one or more hourly jobs to the sequential queue.
+    /// Validates options and appends single-hour or full-day jobs to the sequential queue.
     pub fn enqueue_jobs(
         &self,
         options: StitchOptions,
@@ -75,6 +80,16 @@ impl StitcherEngine {
     /// Cancels a pending job immediately or signals abort on the active job.
     pub fn cancel_job(&self, job_id: String) -> Result<StitchJobSnapshot, StitcherError> {
         self.queue.cancel(&job_id)
+    }
+
+    /// Cancels all pending and active jobs in the queue.
+    pub fn cancel_all_jobs(&self) -> Vec<StitchJobSnapshot> {
+        self.queue.cancel_all()
+    }
+
+    /// Re-enqueues a failed or cancelled job with its original parameters.
+    pub fn retry_job(&self, job_id: String) -> Result<StitchJobSnapshot, StitcherError> {
+        self.queue.retry(&job_id)
     }
 
     /// Returns all queued, active, and historical jobs in insertion order.

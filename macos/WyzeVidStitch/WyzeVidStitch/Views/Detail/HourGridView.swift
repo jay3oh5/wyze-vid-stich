@@ -6,12 +6,12 @@ struct HourGridView: View {
     let dayRecord: DayRecord
 
     private let columns = [
-        GridItem(.adaptive(minimum: 150, maximum: 200), spacing: 12)
+        GridItem(.adaptive(minimum: 155, maximum: 210), spacing: 12)
     ]
 
     var body: some View {
         LazyVGrid(columns: columns, spacing: 12) {
-            ForEach(dayRecord.hours, id: \.hour) { hourRecord in
+            ForEach(dayRecord.hours, id: \.sourceDirPath) { hourRecord in
                 HourTileCard(
                     dayRecord: dayRecord,
                     hourRecord: hourRecord,
@@ -57,9 +57,10 @@ private struct HourTileCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(StitcherStore.formatHour12(hourRecord.hour))
                         .font(.headline.monospacedDigit())
-                    Text("\(hourRecord.clipCount)/60 clips")
+                    Text("\(hourRecord.clipCount)/60 clips • \(StitcherStore.formatBytes(hourRecord.totalSizeBytes))")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
 
                 Spacer()

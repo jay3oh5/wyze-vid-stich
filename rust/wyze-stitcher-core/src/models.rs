@@ -7,6 +7,12 @@ pub enum OutputNamingFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StitchMode {
+    SingleHour,
+    FullDay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FootageDensity {
     Empty,
     SevereGaps,
@@ -47,7 +53,9 @@ impl JobStatus {
 #[derive(Debug, Clone)]
 pub struct HourRecord {
     pub hour: String,
+    pub source_dir_path: String,
     pub clip_count: u32,
+    pub total_size_bytes: u64,
     pub clips: Vec<String>,
     pub missing_minutes: Vec<String>,
     pub density: FootageDensity,
@@ -85,6 +93,8 @@ pub struct StitchOptions {
 pub struct StitchJobRequest {
     pub day: String,
     pub hour: String,
+    pub mode: StitchMode,
+    pub hour_dir_paths: Vec<String>,
     pub selected_clips: Option<Vec<String>>,
 }
 
@@ -93,6 +103,7 @@ pub struct StitchJobSnapshot {
     pub id: String,
     pub day: String,
     pub hour: String,
+    pub mode: StitchMode,
     pub status: JobStatus,
     pub total_clips: u32,
     pub processed_clips: u32,
@@ -102,6 +113,7 @@ pub struct StitchJobSnapshot {
     pub file_size_bytes: u64,
     pub duration_ms: u64,
     pub used_audio_fallback: bool,
+    pub deleted_sources: bool,
     pub error_message: Option<String>,
     pub logs: Vec<String>,
 }
@@ -133,4 +145,7 @@ pub trait AudioRemuxFallback: Send + Sync {
         input_clip_paths: Vec<String>,
         temp_output_path: String,
     ) -> Result<(), StitcherError>;
+
+    /// Synchronously aborts any active AVFoundation reader/writer session for `job_id`.
+    fn cancel_remux(&self, job_id: String);
 }

@@ -11,22 +11,60 @@ struct DayDetailView: View {
         }.count
     }
 
+    private var dayTotalSizeBytes: UInt64 {
+        dayRecord.hours.reduce(0) { $0 + $1.totalSizeBytes }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                // Header & Batch Selection Controls
+                // Header & Batch Selection / Full-Day Merge Controls
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(dayRecord.formattedDay)
                             .font(.title2.weight(.semibold).monospacedDigit())
-                        Text("\(dayRecord.hours.count) hours available • \(selectedCountInDay) selected")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "\(dayRecord.hours.count) hours available • \(StitcherStore.formatBytes(dayTotalSizeBytes)) • \(selectedCountInDay) selected"
+                        )
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                     }
 
                     Spacer()
 
                     HStack(spacing: 8) {
+                        Menu {
+                            Button {
+                                store.requestStitchFullDay(for: dayRecord, onlySelectedHours: false)
+                            } label: {
+                                Label(
+                                    "Merge Entire Day (\(dayRecord.hours.count) Hours)",
+                                    systemImage: "film.stack"
+                                )
+                            }
+
+                            Button {
+                                store.requestStitchFullDay(for: dayRecord, onlySelectedHours: true)
+                            } label: {
+                                Label(
+                                    "Merge Selected Hours into One File (\(selectedCountInDay) Hours)",
+                                    systemImage: "rectangle.stack.badge.play"
+                                )
+                            }
+                            .disabled(selectedCountInDay < 2)
+                        } label: {
+                            Label("Stitch Full Day", systemImage: "film.stack")
+                        } primaryAction: {
+                            store.requestStitchFullDay(for: dayRecord, onlySelectedHours: false)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(dayRecord.hours.isEmpty)
+                        .help("Compile all hours in \(dayRecord.formattedDay) into a single continuous MP4")
+
+                        Divider()
+                            .frame(height: 16)
+
                         Button("Select All") {
                             withAnimation(.snappy(duration: 0.2)) {
                                 store.selectAllHours(in: dayRecord)

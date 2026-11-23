@@ -7,23 +7,59 @@ struct JobQueueView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Queue Header Bar
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Compilation Queue & History")
-                        .font(.title2.weight(.semibold))
-                    Text(queueSubtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            // Queue Header Bar + Aggregate Batch Progress
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Compilation Queue & History")
+                            .font(.title2.weight(.semibold))
+                        Text(queueSubtitle)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 8) {
+                        if store.activeJobCount > 0 {
+                            Button("Cancel All", role: .destructive) {
+                                store.cancelAllJobs()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        if store.failedOrCancelledCount > 0 {
+                            Button {
+                                store.retryAllFailedJobs()
+                            } label: {
+                                Label("Retry Failed (\(store.failedOrCancelledCount))", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Button("Clear History") {
+                            store.clearFinishedJobs()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!store.jobs.contains(where: { $0.status.isTerminal }))
+                    }
                 }
 
-                Spacer()
-
-                Button("Clear History") {
-                    store.clearFinishedJobs()
+                if store.activeJobCount > 0 {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Overall Batch Progress")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(Int((store.aggregateProgress * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        ProgressView(value: store.aggregateProgress, total: 1.0)
+                            .progressViewStyle(.linear)
+                    }
                 }
-                .buttonStyle(.bordered)
-                .disabled(!store.jobs.contains(where: { $0.status.isTerminal }))
             }
             .padding(24)
 
@@ -33,7 +69,7 @@ struct JobQueueView: View {
                 ContentUnavailableView(
                     "No Compilation Jobs",
                     systemImage: "tray",
-                    description: Text("Select one or more hours from any recorded day and click Stitch Selected to start compiling.")
+                    description: Text("Select one or more hours from any recorded day and click Stitch Selected or Stitch Full Day to start compiling.")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -51,6 +87,7 @@ struct JobQueueView: View {
                                     }
                                 },
                                 onCancel: { store.cancelJob(job.id) },
+                                onRetry: { store.retryJob(job.id) },
                                 onPlay: { store.playCompletedJob(job) },
                                 onReveal: { store.revealJobInFinder(job) }
                             )
@@ -64,9 +101,7 @@ struct JobQueueView: View {
     }
 
     private var queueSubtitle: String {
-        let active = store.activeJobCount
-        let completed = store.jobs.filter { $0.status == .completed }.count
-        return "\(active) active • \(completed) completed • \(store.jobs.count) total"
+        "\(store.activeJobCount) active • \(store.completedJobCount) completed • \(store.jobs.count) total"
     }
 }
 
@@ -75,6 +110,7 @@ private struct JobRowCard: View {
     let isShowingLogs: Bool
     let onToggleLogs: () -> Void
     let onCancel: () -> Void
+    let onRetry: () -> Void
     let onPlay: () -> Void
     let onReveal: () -> Void
 
@@ -87,9 +123,19 @@ private struct JobRowCard: View {
                     HStack(spacing: 6) {
                         Text(StitcherStore.formatDay(job.day))
                             .font(.headline.monospacedDigit())
-                        Text(StitcherStore.formatHour12(job.hour))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+
+                        if job.mode == .fullDay {
+                            Text("Full Day")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.teal.opacity(0.18), in: Capsule())
+                                .foregroundStyle(.teal)
+                        } else {
+                            Text(StitcherStore.formatHour12(job.hour))
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
 
                         if job.usedAudioFallback {
                             Text("AVFoundation AAC")
@@ -135,6 +181,7 @@ private struct JobRowCard: View {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                     Text(errorMessage)
+                        .textSelection(.enabled)
                 }
                 .font(.caption)
                 .foregroundStyle(.red)
@@ -206,6 +253,16 @@ private struct JobRowCard: View {
             if !job.status.isTerminal {
                 Button(job.status == .pending ? "Remove" : "Cancel", role: .destructive) {
                     onCancel()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if job.status == .failed || job.status == .cancelled {
+                Button {
+                    onRetry()
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)

@@ -6,6 +6,8 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>WyzeVidStitch</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.jay3oh5.wyze-vid-stitch</string>
     <key>CFBundleInfoDictionaryVersion</key>

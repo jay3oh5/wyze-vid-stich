@@ -71,9 +71,17 @@ struct SettingsView: View {
                 .pickerStyle(.radioGroup)
 
                 HStack {
-                    Text("Preview:")
+                    Text("Hourly preview:")
                         .foregroundStyle(.secondary)
                     Text("\(previewFilename), \(previewAfternoonFilename)")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary)
+                }
+
+                HStack {
+                    Text("Full-Day preview:")
+                        .foregroundStyle(.secondary)
+                    Text(previewFullDayFilename(day: "20260529"))
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.primary)
                 }

@@ -5,25 +5,25 @@ This repository contains both the original Node.js/React web prototype and the n
 ## Architecture Overview
 
 1. **Portable Rust Core (`rust/wyze-stitcher-core`)**
-   - **`mp4-merge`**: Fast, lossless container-level MP4 concatenation (`src/merger.rs`) with atomic `.tmp.mp4` staging and progress throttling.
-   - **Rayon Parallel Scanner (`src/scanner.rs`)**: Multi-threaded directory walker for `/record/YYYYMMDD/HH/MM.mp4`, computing clip counts, missing minute gaps (`00`–`59`), density buckets, and a fast zero-decode MP4 `stsd` header check for legacy Wyze non-AAC audio (`ulaw`/`alaw`/`pcm`).
-   - **Tokio Sequential Queue (`src/queue.rs`)**: Single-worker background queue with per-job cancellation flags, real-time push callbacks, atomic verification, and optional post-compile source clip cleanup.
-   - **Configurable Output Naming (`src/naming.rs`)**: Defaults to sortable 24-hour (`YYYY-MM-DD_HH00.mp4`), with a Settings toggle for 12-hour legacy naming (`YYYY-MM-DD_!12AM.mp4`).
+   - **Adaptive Rayon Parallel Scanner (`src/scanner.rs`)**: Multi-threaded scanner supporting direct hour folders, day folders, SD card roots (`record/`), standard `/record/YYYYMMDD/HH/MM.mp4` hierarchies, and multi-folder aggregation. Captures exact `source_dir_path`, per-hour byte sizes, missing minute gaps (`00`–`59`), density buckets, and zero-decode MP4 `stsd` non-AAC audio detection.
+   - **Lossless MP4 Merger & Strict Validator (`src/merger.rs`)**: Strictly pre-validates every input clip (fail-fast with exact filename diagnostics on 0-byte or corrupt MP4 headers), then runs `mp4_merge::join_files` with throttled progress callbacks and atomic `.tmp.mp4` staging.
+   - **Sequential Background Queue (`src/queue.rs`)**: Tokio single-worker queue supporting both **Per-Hour** and **Full-Day** merged outputs, one-click `retry_job`, `cancel_job` / `cancel_all_jobs` (including immediate cooperative abort of active AVFoundation remuxes), atomic verification, and optional post-compile source cleanup.
+   - **Configurable Output Naming (`src/naming.rs`)**: Defaults to sortable 24-hour (`YYYY-MM-DD_HH00.mp4`), with a Settings option for 12-hour legacy naming (`YYYY-MM-DD_!12AM.mp4`) and `YYYY-MM-DD_FullDay.mp4` for full-day merges.
 
 2. **Mozilla UniFFI Bridge (`rust/wyze-stitcher-core/src/wyze_stitcher.udl`)**
-   - Generates type-safe Swift `async throws` methods (`scanDirectory`), push event callbacks (`StitchEventListener`), and a foreign async fallback trait (`AudioRemuxFallback`).
+   - Generates type-safe Swift `async throws` methods (`scanDirectory`), push event callbacks (`StitchEventListener`), and the cooperative `AudioRemuxFallback` foreign trait (`remuxClipsToAac` + `cancelRemux`).
 
 3. **Native macOS 14+ SwiftUI App (`macos/WyzeVidStitch`)**
-   - **`NavigationSplitView`** layout with adaptive **Auto / Light / Dark** appearance picker in Settings (`Cmd+,`).
-   - **24-Hour Footage Density Heatmap (`Heatmap24hView.swift`)** and **Minute-by-Minute 60-Tile Exclusion Inspector (`ClipInspectorSheet.swift`)**.
-   - **Native `AVPlayerView` (`NativeVideoPlayerSheet.swift`)** opening local `.mp4` files directly with hardware acceleration.
-   - **`AVFoundationRemuxer.swift`**: Implements UniFFI's `AudioRemuxFallback` using `AVAssetReader` / `AVAssetWriter` (lossless video passthrough + AAC audio transcode) for legacy Wyze cameras with zero FFmpeg dependency.
-   - **Direct DMG Distribution (`WyzeVidStitch.entitlements`)**: Non-sandboxed (`com.apple.security.app-sandbox = false`) for seamless `/Volumes` SD card access.
+   - **`NavigationSplitView`** layout with adaptive **Auto / Light / Dark** appearance picker in Settings (`Cmd+,`), **folder drag-and-drop**, and automatic **Wyze SD card mount detection** (`NSWorkspace`).
+   - **24-Hour Footage Density Heatmap (`Heatmap24hView.swift`)**, per-hour size badges, and **Stitch Full Day / Multi-Hour Merge** controls.
+   - **Upgraded 60-Minute Clip Exclusion Inspector (`ClipInspectorSheet.swift`)**: Inline 1-minute `AVPlayerView` quick preview (with 0-byte warnings) and **Shift-click** contiguous range selection.
+   - **Power Queue & Native Playback (`JobQueueView.swift`, `NativeVideoPlayerSheet.swift`)**: Aggregate batch progress bar, Dock tile progress indicator, pre-flight free disk space guard (500 MB safety buffer), **Cancel All**, **Retry Failed** / per-job **Retry**, automatic post-cleanup rescan, and native `AVPlayerView` playback.
+   - **Native Packaging (`scripts/generate-icon.sh`, `scripts/package-app.sh`)**: Generates a Retina `AppIcon.icns` via CoreGraphics + `iconutil` and packages a drag-to-`/Applications` Universal2 DMG.
 
 ## Building on macOS
 
 ### Prerequisites
-- macOS 14+ with Xcode 15+ and Command Line Tools
+- macOS 14+ with Xcode 15+ (or Command Line Tools)
 - Rust toolchain via `rustup` (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`)
 
 ### 1. Run Rust Core Unit Tests
@@ -31,15 +31,15 @@ This repository contains both the original Node.js/React web prototype and the n
 cargo test --workspace
 ```
 
-### 2. Build Universal2 XCFramework & Generate Swift Bindings
+### 2. Build Universal2 XCFramework & Regenerate Swift Bindings
 ```bash
 chmod +x scripts/build-xcframework.sh
 ./scripts/build-xcframework.sh
 ```
-This compiles `libwyze_stitcher_core.a` for both Apple Silicon and Intel, generates `wyze_stitcher.swift` from `src/wyze_stitcher.udl`, and packages `macos/WyzeVidStitch/Packages/WyzeStitcherKit/WyzeStitcherCoreFFI.xcframework`.
+> Always rerun `./scripts/build-xcframework.sh` whenever `wyze_stitcher.udl` changes so `wyze_stitcher.swift` and `WyzeStitcherCoreFFI.xcframework` stay in sync (also handled automatically by `.github/workflows/build.yml`).
 
-### 3. Open & Build in Xcode
-1. Create or open `macos/WyzeVidStitch/WyzeVidStitch.xcodeproj` targeting **macOS 14.0**.
-2. Add the local Swift Package `macos/WyzeVidStitch/Packages/WyzeStitcherKit` to the app target's Frameworks & Libraries.
-3. Add all source files under `macos/WyzeVidStitch/WyzeVidStitch/` and assign `WyzeVidStitch.entitlements`.
-4. Archive with a **Developer ID Application** certificate, package into a DMG, and notarize with `xcrun notarytool`.
+### 3. Package `.app`, `.zip`, and Drag-to-Applications `.dmg`
+```bash
+chmod +x scripts/package-app.sh scripts/generate-icon.sh
+./scripts/package-app.sh
+```

@@ -15,7 +15,7 @@ struct InspectorTarget: Identifiable, Hashable {
     let formattedDay: String
     let hourRecord: HourRecord
 
-    var id: String { "\(day)_\(hourRecord.hour)" }
+    var id: String { "\(day)_\(hourRecord.hour)_\(hourRecord.sourceDirPath)" }
 
     static func == (lhs: InspectorTarget, rhs: InspectorTarget) -> Bool {
         lhs.id == rhs.id
@@ -54,8 +54,32 @@ final class StitcherStore {
     var activeJobCount: Int {
         jobs.filter { !$0.status.isTerminal }.count
     }
+    var failedOrCancelledCount: Int {
+        jobs.filter { $0.status == .failed || $0.status == .cancelled }.count
+    }
+    var completedJobCount: Int {
+        jobs.filter { $0.status == .completed }.count
+    }
+    var aggregateProgress: Double {
+        guard !jobs.isEmpty else { return 0.0 }
+        let total = jobs.reduce(0.0) { acc, job in
+            switch job.status {
+            case .completed, .failed, .cancelled:
+                return acc + 1.0
+            case .running, .remuxingFallback:
+                return acc + Double(job.progress)
+            case .pending:
+                return acc
+            }
+        }
+        return min(max(total / Double(jobs.count), 0.0), 1.0)
+    }
 
-    // Sheets & Confirmation State
+    // SD Card Auto-Detection Banner
+    var detectedSDCard: DetectedSDCard?
+    var dismissedSDCardId: String?
+
+    // Sheets, Disk Guard & Confirmation State
     var inspectingTarget: InspectorTarget?
     var activePlayback: PlaybackTarget?
     var pendingDeleteConfirmationAction: (() -> Void)?
@@ -64,7 +88,9 @@ final class StitcherStore {
 
     @ObservationIgnored private var engine: StitcherEngine!
     @ObservationIgnored private var bridgeAdapter: StitcherEventBridge!
+    @ObservationIgnored private var sdMonitor: SDCardMonitor?
     @ObservationIgnored private var knownCompletedJobIds: Set<String> = []
+    @ObservationIgnored private var needsRescanOnIdle: Bool = false
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -86,11 +112,22 @@ final class StitcherStore {
         self.bridgeAdapter = bridge
         self.engine = StitcherEngine(listener: bridge, remuxFallback: remuxer)
         bridge.store = self
+
+        self.sdMonitor = SDCardMonitor { [weak self] card in
+            guard let self else { return }
+            if let card, card.id != self.dismissedSDCardId {
+                self.detectedSDCard = card
+            } else if card == nil {
+                self.detectedSDCard = nil
+                self.dismissedSDCardId = nil
+            }
+        }
     }
 
     // MARK: - Formatting Helpers
 
     static func formatHour12(_ hourStr: String) -> String {
+        if hourStr == "ALL" { return "Full Day" }
         let h = Int(hourStr) ?? 0
         let ampm = h >= 12 ? "PM" : "AM"
         let displayH = h % 12 == 0 ? 12 : h % 12
@@ -113,7 +150,7 @@ final class StitcherStore {
         "\(day)_\(hour)"
     }
 
-    // MARK: - Folder Selection & Scanning
+    // MARK: - Folder Ingestion (Browse, Drag-and-Drop, SD Auto-Detect)
 
     func browseSourceFolder() {
         if let path = FolderPickerService.pickFolder(prompt: "Select Wyze Camera Record Folder") {
@@ -122,11 +159,43 @@ final class StitcherStore {
         }
     }
 
+    func handleDroppedFolderURL(_ url: URL) {
+        var isDir: ObjCBool = false
+        let targetURL: URL
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            targetURL = url
+        } else {
+            targetURL = url.deletingLastPathComponent()
+        }
+        settings.sourceDir = targetURL.path
+        Task { await scanSourceDirectory() }
+    }
+
+    func scanDetectedSDCard() {
+        guard let card = detectedSDCard else { return }
+        settings.sourceDir = card.recordPath
+        dismissedSDCardId = card.id
+        detectedSDCard = nil
+        Task { await scanSourceDirectory() }
+    }
+
+    func dismissSDCardBanner() {
+        dismissedSDCardId = detectedSDCard?.id
+        detectedSDCard = nil
+    }
+
     func scanSourceDirectory() async {
         let source = settings.sourceDir.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !source.isEmpty else {
             scanError = "Choose a Wyze /record directory first."
             return
+        }
+
+        let previouslySelectedDay: String?
+        if case .day(let dayId) = sidebarSelection {
+            previouslySelectedDay = dayId
+        } else {
+            previouslySelectedDay = nil
         }
 
         isScanning = true
@@ -138,7 +207,11 @@ final class StitcherStore {
             days = result.days
             lastScanSummary = "\(result.totalDays) days • \(result.totalHours) hours • \(result.totalClips) clips (\(result.scanDurationMs) ms)"
 
-            if let firstDay = result.days.first {
+            if let prev = previouslySelectedDay, result.days.contains(where: { $0.day == prev }) {
+                sidebarSelection = .day(prev)
+            } else if sidebarSelection == .queue {
+                // Keep Queue open if auto-rescan triggered while viewing Queue.
+            } else if let firstDay = result.days.first {
                 sidebarSelection = .day(firstDay.day)
             } else {
                 sidebarSelection = nil
@@ -186,32 +259,126 @@ final class StitcherStore {
         }
     }
 
-    // MARK: - Job Submission & Queue Control
+    func estimatedSelectedBytes() -> UInt64 {
+        var total: UInt64 = 0
+        for day in days {
+            for hour in day.hours {
+                if selectedHours.contains(hourKey(day: day.day, hour: hour.hour)) {
+                    total += hour.totalSizeBytes
+                }
+            }
+        }
+        return total
+    }
+
+    // MARK: - Job Submission (Per-Hour & Full-Day) + Disk Space Guard
 
     func requestStitchSelectedHours() {
         guard !selectedHours.isEmpty else { return }
 
-        let requests: [StitchJobRequest] = selectedHours.sorted().compactMap { key in
-            let parts = key.split(separator: "_")
-            guard parts.count == 2 else { return nil }
-            return StitchJobRequest(
-                day: String(parts[0]),
-                hour: String(parts[1]),
-                selectedClips: nil
-            )
+        var requests: [StitchJobRequest] = []
+        var estimatedBytes: UInt64 = 0
+
+        for day in days {
+            for hour in day.hours {
+                if selectedHours.contains(hourKey(day: day.day, hour: hour.hour)) {
+                    requests.append(
+                        StitchJobRequest(
+                            day: day.day,
+                            hour: hour.hour,
+                            mode: .singleHour,
+                            hourDirPaths: [hour.sourceDirPath],
+                            selectedClips: nil
+                        )
+                    )
+                    estimatedBytes += hour.totalSizeBytes
+                }
+            }
         }
 
-        submitWithSafetyCheck(requests: requests, clearSelectionOnSuccess: true)
+        guard !requests.isEmpty else { return }
+        submitWithGuards(
+            requests: requests,
+            estimatedOutputBytes: estimatedBytes,
+            clearSelectionOnSuccess: true
+        )
     }
 
-    func requestStitchCustomSelection(day: String, hour: String, clips: [String]) {
+    /// Merges all recorded hours (or only the currently selected hours) of a day into one continuous MP4.
+    func requestStitchFullDay(for dayRecord: DayRecord, onlySelectedHours: Bool = false) {
+        let targetHours: [HourRecord]
+        if onlySelectedHours {
+            targetHours = dayRecord.hours.filter {
+                selectedHours.contains(hourKey(day: dayRecord.day, hour: $0.hour))
+            }
+        } else {
+            targetHours = dayRecord.hours
+        }
+
+        guard !targetHours.isEmpty else { return }
+
+        let hourPaths = targetHours.map(\.sourceDirPath)
+        let estimatedBytes = targetHours.reduce(UInt64(0)) { $0 + $1.totalSizeBytes }
+        let label = onlySelectedHours ? "\(targetHours.count)h Merge" : "ALL"
+
+        let request = StitchJobRequest(
+            day: dayRecord.day,
+            hour: label,
+            mode: .fullDay,
+            hourDirPaths: hourPaths,
+            selectedClips: nil
+        )
+
+        submitWithGuards(
+            requests: [request],
+            estimatedOutputBytes: estimatedBytes,
+            clearSelectionOnSuccess: onlySelectedHours
+        )
+    }
+
+    func requestStitchCustomSelection(target: InspectorTarget, clips: [String]) {
         guard !clips.isEmpty else { return }
-        let request = StitchJobRequest(day: day, hour: hour, selectedClips: clips.sorted())
+
+        // Estimate proportional size for custom subset.
+        let fraction = Double(clips.count) / Double(max(target.hourRecord.clipCount, 1))
+        let estimatedBytes = UInt64(Double(target.hourRecord.totalSizeBytes) * fraction)
+
+        let request = StitchJobRequest(
+            day: target.day,
+            hour: target.hourRecord.hour,
+            mode: .singleHour,
+            hourDirPaths: [target.hourRecord.sourceDirPath],
+            selectedClips: clips.sorted()
+        )
         inspectingTarget = nil
-        submitWithSafetyCheck(requests: [request], clearSelectionOnSuccess: false)
+
+        submitWithGuards(
+            requests: [request],
+            estimatedOutputBytes: estimatedBytes,
+            clearSelectionOnSuccess: false
+        )
     }
 
-    private func submitWithSafetyCheck(requests: [StitchJobRequest], clearSelectionOnSuccess: Bool) {
+    private func submitWithGuards(
+        requests: [StitchJobRequest],
+        estimatedOutputBytes: UInt64,
+        clearSelectionOnSuccess: Bool
+    ) {
+        let destinationDir = settings.useSameFolder
+            ? settings.sourceDir
+            : settings.customOutputDir.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !destinationDir.isEmpty {
+            let diskStatus = DiskSpaceService.checkAvailableSpace(
+                forDestinationPath: destinationDir,
+                estimatedOutputBytes: estimatedOutputBytes
+            )
+            if case .insufficient(let required, let available, let dest) = diskStatus {
+                errorBanner = "Insufficient disk space on destination volume (\(dest)). Estimated required (with 500 MB buffer): \(Self.formatBytes(required)), available: \(Self.formatBytes(available))."
+                return
+            }
+        }
+
         let execute = { [weak self] in
             guard let self else { return }
             self.enqueue(requests: requests, clearSelectionOnSuccess: clearSelectionOnSuccess)
@@ -234,32 +401,69 @@ final class StitcherStore {
                 selectedHours.removeAll()
             }
             sidebarSelection = .queue
+            updateDockProgress()
         } catch {
             errorBanner = error.localizedDescription
         }
     }
 
+    // MARK: - Queue Controls (Cancel, Cancel All, Retry, Clear)
+
     func cancelJob(_ jobId: String) {
         do {
             _ = try engine.cancelJob(jobId: jobId)
+            updateDockProgress()
         } catch {
             errorBanner = error.localizedDescription
+        }
+    }
+
+    func cancelAllJobs() {
+        jobs = engine.cancelAllJobs()
+        updateDockProgress()
+    }
+
+    func retryJob(_ jobId: String) {
+        errorBanner = nil
+        do {
+            _ = try engine.retryJob(jobId: jobId)
+            updateDockProgress()
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    func retryAllFailedJobs() {
+        let failedIds = jobs
+            .filter { $0.status == .failed || $0.status == .cancelled }
+            .map(\.id)
+        for id in failedIds {
+            retryJob(id)
         }
     }
 
     func clearFinishedJobs() {
         jobs = engine.clearFinishedJobs()
+        updateDockProgress()
     }
 
     func playCompletedJob(_ job: StitchJobSnapshot) {
         guard let outputPath = job.outputPath else { return }
-        let title = "\(Self.formatDay(job.day)) • \(Self.formatHour12(job.hour))"
+        let suffix = job.mode == .fullDay ? "Full Day" : Self.formatHour12(job.hour)
+        let title = "\(Self.formatDay(job.day)) • \(suffix)"
         activePlayback = PlaybackTarget(title: title, filePath: outputPath)
     }
 
     func revealJobInFinder(_ job: StitchJobSnapshot) {
         guard let outputPath = job.outputPath else { return }
         FolderPickerService.revealInFinder(path: outputPath)
+    }
+
+    private func updateDockProgress() {
+        DockProgressService.shared.update(
+            progress: aggregateProgress,
+            activeCount: activeJobCount
+        )
     }
 
     // MARK: - Rust Push Callbacks (Dispatched on @MainActor)
@@ -271,13 +475,16 @@ final class StitcherStore {
             jobs.append(snapshot)
         }
 
-        // Fire one-time completion side effects (Finder reveal + macOS Notification Center).
         if snapshot.status == .completed && !knownCompletedJobIds.contains(snapshot.id) {
             knownCompletedJobIds.insert(snapshot.id)
+            if snapshot.deletedSources {
+                needsRescanOnIdle = true
+            }
             if settings.sendNotifications {
+                let label = snapshot.mode == .fullDay ? "Full Day" : Self.formatHour12(snapshot.hour)
                 NotificationService.sendJobNotification(
                     title: "Stitch Complete",
-                    body: "Compiled \(Self.formatDay(snapshot.day)) \(Self.formatHour12(snapshot.hour)) (\(Self.formatBytes(snapshot.fileSizeBytes)))."
+                    body: "Compiled \(Self.formatDay(snapshot.day)) \(label) (\(Self.formatBytes(snapshot.fileSizeBytes)))."
                 )
             }
             if settings.autoRevealInFinder, let path = snapshot.outputPath {
@@ -286,12 +493,15 @@ final class StitcherStore {
         } else if snapshot.status == .failed && !knownCompletedJobIds.contains(snapshot.id) {
             knownCompletedJobIds.insert(snapshot.id)
             if settings.sendNotifications {
+                let label = snapshot.mode == .fullDay ? "Full Day" : Self.formatHour12(snapshot.hour)
                 NotificationService.sendJobNotification(
                     title: "Stitch Failed",
-                    body: "\(Self.formatDay(snapshot.day)) \(Self.formatHour12(snapshot.hour)): \(snapshot.errorMessage ?? "Unknown error")"
+                    body: "\(Self.formatDay(snapshot.day)) \(label): \(snapshot.errorMessage ?? "Unknown error")"
                 )
             }
         }
+
+        updateDockProgress()
     }
 
     fileprivate func handleJobProgress(_ event: JobProgressEvent) {
@@ -301,6 +511,7 @@ final class StitcherStore {
             id: current.id,
             day: current.day,
             hour: current.hour,
+            mode: current.mode,
             status: event.status,
             totalClips: event.totalClips,
             processedClips: event.processedClips,
@@ -310,9 +521,11 @@ final class StitcherStore {
             fileSizeBytes: current.fileSizeBytes,
             durationMs: current.durationMs,
             usedAudioFallback: current.usedAudioFallback || event.status == .remuxingFallback,
+            deletedSources: current.deletedSources,
             errorMessage: current.errorMessage,
             logs: current.logs
         )
+        updateDockProgress()
     }
 
     fileprivate func handleJobLog(jobId: String, line: String) {
@@ -324,6 +537,7 @@ final class StitcherStore {
             id: current.id,
             day: current.day,
             hour: current.hour,
+            mode: current.mode,
             status: current.status,
             totalClips: current.totalClips,
             processedClips: current.processedClips,
@@ -333,9 +547,18 @@ final class StitcherStore {
             fileSizeBytes: current.fileSizeBytes,
             durationMs: current.durationMs,
             usedAudioFallback: current.usedAudioFallback,
+            deletedSources: current.deletedSources,
             errorMessage: current.errorMessage,
             logs: updatedLogs
         )
+    }
+
+    fileprivate func handleQueueIdle() {
+        DockProgressService.shared.clear()
+        if needsRescanOnIdle {
+            needsRescanOnIdle = false
+            Task { await scanSourceDirectory() }
+        }
     }
 }
 
@@ -362,7 +585,9 @@ private final class StitcherEventBridge: StitchEventListener, @unchecked Sendabl
     }
 
     func onQueueIdle() {
-        // Queue idle hook available for dock badge clearing or auto-rescan.
+        Task { @MainActor [weak self] in
+            self?.store?.handleQueueIdle()
+        }
     }
 }
 

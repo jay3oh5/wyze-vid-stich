@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,17 +11,20 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::error::StitcherError;
-use crate::merger::{finalize_staged_output, merge_mp4_lossless, temp_staging_path};
+use crate::merger::{
+    finalize_staged_output, merge_mp4_lossless, temp_staging_path, validate_clips_strict,
+};
 use crate::models::{
     AudioRemuxFallback, JobProgressEvent, JobStatus, StitchEventListener, StitchJobRequest,
-    StitchJobSnapshot, StitchOptions,
+    StitchJobSnapshot, StitchMode, StitchOptions,
 };
-use crate::naming::format_output_filename;
+use crate::naming::{format_full_day_filename, format_output_filename};
 use crate::scanner::{detect_non_aac_audio, extract_hour_from_name, has_minute_clips};
 
 struct InternalJob {
     snapshot: StitchJobSnapshot,
     options: StitchOptions,
+    hour_dir_paths: Vec<String>,
     selected_clips: Option<Vec<String>>,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -53,6 +56,7 @@ pub struct JobQueue {
     state: Arc<Mutex<QueueState>>,
     tx: mpsc::UnboundedSender<String>,
     listener: Arc<dyn StitchEventListener>,
+    remux_fallback: Arc<dyn AudioRemuxFallback>,
 }
 
 impl JobQueue {
@@ -77,6 +81,7 @@ impl JobQueue {
             state,
             tx,
             listener,
+            remux_fallback,
         }
     }
 
@@ -114,7 +119,16 @@ impl JobQueue {
         {
             let mut guard = self.state.lock().expect("queue state poisoned");
             for req in requests {
-                let job_id = format!("{}_{}_{}", req.day, req.hour, &Uuid::new_v4().to_string()[..8]);
+                let mode_tag = match req.mode {
+                    StitchMode::SingleHour => req.hour.as_str(),
+                    StitchMode::FullDay => "FULLDAY",
+                };
+                let job_id = format!(
+                    "{}_{}_{}",
+                    req.day,
+                    mode_tag,
+                    &Uuid::new_v4().to_string()[..8]
+                );
                 let total_clips = req
                     .selected_clips
                     .as_ref()
@@ -125,6 +139,7 @@ impl JobQueue {
                     id: job_id.clone(),
                     day: req.day,
                     hour: req.hour,
+                    mode: req.mode,
                     status: JobStatus::Pending,
                     total_clips,
                     processed_clips: 0,
@@ -134,6 +149,7 @@ impl JobQueue {
                     file_size_bytes: 0,
                     duration_ms: 0,
                     used_audio_fallback: false,
+                    deleted_sources: false,
                     error_message: None,
                     logs: vec![timestamped("Job queued.")],
                 };
@@ -141,6 +157,7 @@ impl JobQueue {
                 let internal = InternalJob {
                     snapshot: snapshot.clone(),
                     options: options.clone(),
+                    hour_dir_paths: req.hour_dir_paths,
                     selected_clips: req.selected_clips,
                     cancel_flag: Arc::new(AtomicBool::new(false)),
                 };
@@ -160,7 +177,7 @@ impl JobQueue {
     }
 
     pub fn cancel(&self, job_id: &str) -> Result<StitchJobSnapshot, StitcherError> {
-        let updated = {
+        let (updated, should_abort_remux) = {
             let mut guard = self.state.lock().expect("queue state poisoned");
             let job = guard
                 .jobs
@@ -170,6 +187,7 @@ impl JobQueue {
                 })?;
 
             job.cancel_flag.store(true, Ordering::SeqCst);
+            let mut abort_remux = false;
 
             if job.snapshot.status == JobStatus::Pending {
                 job.snapshot.status = JobStatus::Cancelled;
@@ -177,20 +195,99 @@ impl JobQueue {
                 job.snapshot
                     .logs
                     .push(timestamped("Job cancelled in queue."));
-            } else if matches!(
-                job.snapshot.status,
-                JobStatus::Running | JobStatus::RemuxingFallback
-            ) {
-                job.snapshot
-                    .logs
-                    .push(timestamped("Cancellation requested; stopping after current step..."));
+            } else if job.snapshot.status == JobStatus::RemuxingFallback {
+                abort_remux = true;
+                job.snapshot.logs.push(timestamped(
+                    "Cancellation requested; aborting AVFoundation remux...",
+                ));
+            } else if job.snapshot.status == JobStatus::Running {
+                job.snapshot.logs.push(timestamped(
+                    "Cancellation requested; stopping after current step...",
+                ));
             }
 
-            job.snapshot.clone()
+            (job.snapshot.clone(), abort_remux)
         };
+
+        if should_abort_remux {
+            self.remux_fallback.cancel_remux(job_id.to_string());
+        }
 
         self.listener.on_job_updated(updated.clone());
         Ok(updated)
+    }
+
+    pub fn cancel_all(&self) -> Vec<StitchJobSnapshot> {
+        let mut to_notify = Vec::new();
+        let mut to_abort_remux = Vec::new();
+
+        {
+            let mut guard = self.state.lock().expect("queue state poisoned");
+            let ids = guard.order.clone();
+            for id in ids {
+                if let Some(job) = guard.jobs.get_mut(&id) {
+                    if job.snapshot.status.is_terminal() {
+                        continue;
+                    }
+                    job.cancel_flag.store(true, Ordering::SeqCst);
+                    if job.snapshot.status == JobStatus::Pending {
+                        job.snapshot.status = JobStatus::Cancelled;
+                        job.snapshot.error_message =
+                            Some("Cancelled by Cancel All.".to_string());
+                        job.snapshot
+                            .logs
+                            .push(timestamped("Job cancelled in queue."));
+                    } else if job.snapshot.status == JobStatus::RemuxingFallback {
+                        to_abort_remux.push(id.clone());
+                        job.snapshot.logs.push(timestamped(
+                            "Cancel All requested; aborting AVFoundation remux...",
+                        ));
+                    } else if job.snapshot.status == JobStatus::Running {
+                        job.snapshot.logs.push(timestamped(
+                            "Cancel All requested; stopping active merge...",
+                        ));
+                    }
+                    to_notify.push(job.snapshot.clone());
+                }
+            }
+        }
+
+        for id in to_abort_remux {
+            self.remux_fallback.cancel_remux(id);
+        }
+        for snap in &to_notify {
+            self.listener.on_job_updated(snap.clone());
+        }
+
+        self.get_all()
+    }
+
+    pub fn retry(&self, job_id: &str) -> Result<StitchJobSnapshot, StitcherError> {
+        let (options, request) = {
+            let guard = self.state.lock().expect("queue state poisoned");
+            let job = guard
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| StitcherError::JobNotFound {
+                    job_id: job_id.to_string(),
+                })?;
+
+            let req = StitchJobRequest {
+                day: job.snapshot.day.clone(),
+                hour: job.snapshot.hour.clone(),
+                mode: job.snapshot.mode,
+                hour_dir_paths: job.hour_dir_paths.clone(),
+                selected_clips: job.selected_clips.clone(),
+            };
+            (job.options.clone(), req)
+        };
+
+        let mut created = self.enqueue(options, vec![request])?;
+        created
+            .pop()
+            .ok_or_else(|| StitcherError::JobNotFound {
+                job_id: job_id.to_string(),
+            })
     }
 
     pub fn get_all(&self) -> Vec<StitchJobSnapshot> {
@@ -210,8 +307,7 @@ impl JobQueue {
                 }
             }
             guard.order = active_order;
-            let active_ids: std::collections::HashSet<String> =
-                guard.order.iter().cloned().collect();
+            let active_ids: HashSet<String> = guard.order.iter().cloned().collect();
             guard.jobs.retain(|id, _| active_ids.contains(id));
             guard.all_snapshots()
         };
@@ -252,7 +348,7 @@ async fn execute_single_job(
 ) {
     let started = Instant::now();
 
-    let (day, hour, options, selected_clips, cancel_flag) = {
+    let (day, hour, mode, options, hour_dir_paths, selected_clips, cancel_flag) = {
         let mut guard = state.lock().expect("queue state poisoned");
         let Some(job) = guard.jobs.get_mut(job_id) else {
             return;
@@ -268,7 +364,9 @@ async fn execute_single_job(
         let data = (
             job.snapshot.day.clone(),
             job.snapshot.hour.clone(),
+            job.snapshot.mode,
             job.options.clone(),
+            job.hour_dir_paths.clone(),
             job.selected_clips.clone(),
             Arc::clone(&job.cancel_flag),
         );
@@ -278,73 +376,113 @@ async fn execute_single_job(
         data
     };
 
+    let scope_desc = match mode {
+        StitchMode::SingleHour => format!("{day} Hour {hour}:00"),
+        StitchMode::FullDay => format!("{day} Full Day ({} hours)", hour_dir_paths.len()),
+    };
     push_log(
         state,
         listener,
         job_id,
-        format!("Starting compile for {day} Hour {hour}:00"),
+        format!("Starting compile for {scope_desc}"),
         false,
     );
 
-    let hour_folder = match resolve_hour_folder(&options.source_dir, &day, &hour) {
-        Some(p) => p,
-        None => {
-            fail_job(
-                state,
-                listener,
-                job_id,
-                format!(
-                    "Hour directory could not be resolved for day {day}, hour {hour} in {}",
-                    options.source_dir
-                ),
-            );
-            return;
-        }
-    };
-
-    // Resolve ordered list of clip filenames.
-    let mut clip_filenames: Vec<String> = match selected_clips {
-        Some(custom) if !custom.is_empty() => custom,
-        _ => match fs::read_dir(&hour_folder) {
-            Ok(entries) => entries
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| name.ends_with(".mp4"))
-                .collect(),
-            Err(err) => {
-                fail_job(
-                    state,
-                    listener,
-                    job_id,
-                    format!("Failed to read hour directory: {err}"),
-                );
-                return;
-            }
-        },
-    };
-    clip_filenames.sort();
-
-    if clip_filenames.is_empty() {
+    // Resolve exact hour folders (preferring scanner-captured paths, falling back to heuristic lookup).
+    let resolved_hour_dirs: Vec<PathBuf> = if !hour_dir_paths.is_empty() {
+        hour_dir_paths.iter().map(PathBuf::from).collect()
+    } else if let Some(found) = resolve_hour_folder(&options.source_dir, &day, &hour) {
+        vec![found]
+    } else {
         fail_job(
             state,
             listener,
             job_id,
-            format!("No MP4 clips found in {}", hour_folder.display()),
+            format!(
+                "Hour directory could not be resolved for day {day}, hour {hour} in {}",
+                options.source_dir
+            ),
+        );
+        return;
+    };
+
+    for dir in &resolved_hour_dirs {
+        if !dir.exists() || !dir.is_dir() {
+            fail_job(
+                state,
+                listener,
+                job_id,
+                format!("Source hour directory does not exist: {}", dir.display()),
+            );
+            return;
+        }
+    }
+
+    // Collect chronologically ordered clip paths across single or multiple hour folders.
+    let mut clip_paths: Vec<PathBuf> = Vec::new();
+    if mode == StitchMode::SingleHour {
+        let hour_folder = &resolved_hour_dirs[0];
+        let mut clip_filenames: Vec<String> = match selected_clips {
+            Some(custom) if !custom.is_empty() => custom,
+            _ => match collect_mp4_filenames(hour_folder) {
+                Ok(files) => files,
+                Err(err) => {
+                    fail_job(
+                        state,
+                        listener,
+                        job_id,
+                        format!("Failed to read hour directory {}: {err}", hour_folder.display()),
+                    );
+                    return;
+                }
+            },
+        };
+        clip_filenames.sort();
+        for name in clip_filenames {
+            clip_paths.push(hour_folder.join(name));
+        }
+    } else {
+        for hour_folder in &resolved_hour_dirs {
+            let mut clip_filenames = match collect_mp4_filenames(hour_folder) {
+                Ok(files) => files,
+                Err(err) => {
+                    fail_job(
+                        state,
+                        listener,
+                        job_id,
+                        format!("Failed to read hour directory {}: {err}", hour_folder.display()),
+                    );
+                    return;
+                }
+            };
+            clip_filenames.sort();
+            for name in clip_filenames {
+                clip_paths.push(hour_folder.join(name));
+            }
+        }
+    }
+
+    if clip_paths.is_empty() {
+        fail_job(
+            state,
+            listener,
+            job_id,
+            format!("No MP4 clips found for {scope_desc}."),
         );
         return;
     }
 
-    let clip_paths: Vec<PathBuf> = clip_filenames
-        .iter()
-        .map(|name| hour_folder.join(name))
-        .collect();
+    let output_filename = match mode {
+        StitchMode::SingleHour => format_output_filename(&day, &hour, options.naming_format),
+        StitchMode::FullDay => format_full_day_filename(&day),
+    };
 
-    let output_filename = format_output_filename(&day, &hour, options.naming_format);
+    let first_hour_folder = &resolved_hour_dirs[0];
     let final_output = if options.use_same_folder {
         let day_dir = PathBuf::from(&options.source_dir).join(&day);
         let target_dir = if day_dir.is_dir() {
             day_dir
-        } else if let Some(parent) = hour_folder.parent() {
+        } else if let Some(parent) = first_hour_folder.parent() {
             if parent.starts_with(&options.source_dir) && parent.is_dir() {
                 parent.to_path_buf()
             } else {
@@ -399,18 +537,35 @@ async fn execute_single_job(
             existing_size,
             started.elapsed().as_millis() as u64,
             false,
+            false,
         );
+        return;
+    }
+
+    // Strict pre-validation: fail fast with exact filename diagnostics if any clip is 0-byte or corrupt.
+    push_log(
+        state,
+        listener,
+        job_id,
+        format!("Validating {} input clips...", clip_paths.len()),
+        false,
+    );
+    if let Err(err) = validate_clips_strict(&clip_paths) {
+        fail_job(state, listener, job_id, err.to_string());
         return;
     }
 
     let temp_output = temp_staging_path(&final_output, job_id);
     let total_clips = clip_paths.len() as u32;
 
-    // Pre-check audio FourCC in first clip to detect legacy Wyze μ-law / PCM audio.
-    let needs_audio_remux = clip_paths
-        .first()
-        .map(|p| detect_non_aac_audio(p))
-        .unwrap_or(false);
+    // Inspect the first clip of each involved hour directory for legacy non-AAC audio.
+    let needs_audio_remux = resolved_hour_dirs.iter().any(|dir| {
+        clip_paths
+            .iter()
+            .find(|p| p.parent() == Some(dir.as_path()))
+            .map(|first| detect_non_aac_audio(first))
+            .unwrap_or(false)
+    });
 
     let mut used_fallback = false;
 
@@ -431,24 +586,29 @@ async fn execute_single_job(
         let progress_job_id = job_id.to_string();
 
         let join_res = tokio::task::spawn_blocking(move || {
-            merge_mp4_lossless(&merge_clips, &merge_temp, &merge_cancel, |progress, processed, clip_name| {
-                {
-                    let mut guard = progress_state.lock().expect("queue state poisoned");
-                    if let Some(job) = guard.jobs.get_mut(&progress_job_id) {
-                        job.snapshot.progress = progress;
-                        job.snapshot.processed_clips = processed;
-                        job.snapshot.current_clip_name = clip_name.clone();
+            merge_mp4_lossless(
+                &merge_clips,
+                &merge_temp,
+                &merge_cancel,
+                |progress, processed, clip_name| {
+                    {
+                        let mut guard = progress_state.lock().expect("queue state poisoned");
+                        if let Some(job) = guard.jobs.get_mut(&progress_job_id) {
+                            job.snapshot.progress = progress;
+                            job.snapshot.processed_clips = processed;
+                            job.snapshot.current_clip_name = clip_name.clone();
+                        }
                     }
-                }
-                progress_listener.on_job_progress(JobProgressEvent {
-                    job_id: progress_job_id.clone(),
-                    status: JobStatus::Running,
-                    progress,
-                    processed_clips: processed,
-                    total_clips,
-                    current_clip_name: clip_name,
-                });
-            })
+                    progress_listener.on_job_progress(JobProgressEvent {
+                        job_id: progress_job_id.clone(),
+                        status: JobStatus::Running,
+                        progress,
+                        processed_clips: processed,
+                        total_clips,
+                        current_clip_name: clip_name,
+                    });
+                },
+            )
         })
         .await;
 
@@ -471,7 +631,9 @@ async fn execute_single_job(
                     state,
                     listener,
                     job_id,
-                    format!("mp4-merge reported incompatibility ({err}); switching to AVFoundation AAC remux fallback..."),
+                    format!(
+                        "mp4-merge reported incompatibility ({err}); switching to AVFoundation AAC remux fallback..."
+                    ),
                     false,
                 );
                 used_fallback = true;
@@ -503,7 +665,6 @@ async fn execute_single_job(
             return;
         }
 
-        // Transition status to RemuxingFallback so SwiftUI displays the AVFoundation badge.
         {
             let mut guard = state.lock().expect("queue state poisoned");
             if let Some(job) = guard.jobs.get_mut(job_id) {
@@ -578,6 +739,7 @@ async fn execute_single_job(
     );
 
     // Optional destructive post-compile cleanup (runs ONLY after verified atomic output).
+    let mut deleted_sources = false;
     if options.delete_after_compile {
         push_log(
             state,
@@ -592,6 +754,7 @@ async fn execute_single_job(
                 deleted_count += 1;
             }
         }
+        deleted_sources = deleted_count > 0;
         push_log(
             state,
             listener,
@@ -600,20 +763,47 @@ async fn execute_single_job(
             false,
         );
 
-        if let Ok(mut remaining) = fs::read_dir(&hour_folder) {
-            if remaining.next().is_none() && fs::remove_dir(&hour_folder).is_ok() {
-                push_log(
-                    state,
-                    listener,
-                    job_id,
-                    format!("Removed empty hour directory: {hour}"),
-                    false,
-                );
+        for hour_folder in &resolved_hour_dirs {
+            if let Ok(mut remaining) = fs::read_dir(hour_folder) {
+                if remaining.next().is_none() && fs::remove_dir(hour_folder).is_ok() {
+                    push_log(
+                        state,
+                        listener,
+                        job_id,
+                        format!("Removed empty hour directory: {}", hour_folder.display()),
+                        false,
+                    );
+                }
             }
         }
     }
 
-    complete_job(state, listener, job_id, final_size, elapsed_ms, used_fallback);
+    complete_job(
+        state,
+        listener,
+        job_id,
+        final_size,
+        elapsed_ms,
+        used_fallback,
+        deleted_sources,
+    );
+}
+
+fn collect_mp4_filenames(hour_folder: &Path) -> Result<Vec<String>, std::io::Error> {
+    let files = fs::read_dir(hour_folder)?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| {
+            name.strip_suffix(".mp4")
+                .map(|stem| {
+                    stem.len() == 2
+                        && stem.bytes().all(|b| b.is_ascii_digit())
+                        && stem.parse::<u32>().map(|m| m < 60).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    Ok(files)
 }
 
 fn timestamped(msg: &str) -> String {
@@ -649,6 +839,7 @@ fn complete_job(
     file_size_bytes: u64,
     duration_ms: u64,
     used_audio_fallback: bool,
+    deleted_sources: bool,
 ) {
     let snap = {
         let mut guard = state.lock().expect("queue state poisoned");
@@ -662,6 +853,7 @@ fn complete_job(
         job.snapshot.file_size_bytes = file_size_bytes;
         job.snapshot.duration_ms = duration_ms;
         job.snapshot.used_audio_fallback = used_audio_fallback;
+        job.snapshot.deleted_sources = deleted_sources;
         job.snapshot.clone()
     };
     listener.on_job_updated(snap);
@@ -711,30 +903,25 @@ fn mark_cancelled(
 fn resolve_hour_folder(source_dir: &str, day: &str, hour: &str) -> Option<PathBuf> {
     let root = PathBuf::from(source_dir);
 
-    // 1. Direct hour folder (e.g. source_dir is ".../11")
     if has_minute_clips(&root) {
         return Some(root);
     }
 
-    // 2. Standard Wyze: root/day/hour
     let standard = root.join(day).join(hour);
     if standard.is_dir() && has_minute_clips(&standard) {
         return Some(standard);
     }
 
-    // 3. SD card root with record/: root/record/day/hour
     let record_standard = root.join("record").join(day).join(hour);
     if record_standard.is_dir() && has_minute_clips(&record_standard) {
         return Some(record_standard);
     }
 
-    // 4. Day folder directly selected: root/hour
     let direct_hour = root.join(hour);
     if direct_hour.is_dir() && has_minute_clips(&direct_hour) {
         return Some(direct_hour);
     }
 
-    // 5. Look for matching hour folder in immediate subdirectories of root
     if let Ok(entries) = fs::read_dir(&root) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -748,7 +935,6 @@ fn resolve_hour_folder(source_dir: &str, day: &str, hour: &str) -> Option<PathBu
         }
     }
 
-    // 6. Look for matching hour folder inside root/record
     let record_dir = root.join("record");
     if record_dir.is_dir() {
         if let Ok(entries) = fs::read_dir(&record_dir) {
@@ -764,7 +950,6 @@ fn resolve_hour_folder(source_dir: &str, day: &str, hour: &str) -> Option<PathBu
         }
     }
 
-    // Fallbacks if directory exists
     if standard.is_dir() {
         return Some(standard);
     }
