@@ -142,6 +142,7 @@ final class StitcherStore {
                 sidebarSelection = .day(firstDay.day)
             } else {
                 sidebarSelection = nil
+                scanError = "No supported Wyze footage found in the selected folder. Ensure the folder contains hour directories with .mp4 clips or a Wyze record structure."
             }
         } catch {
             days = []

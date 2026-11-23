@@ -10,8 +10,13 @@ use crate::error::StitcherError;
 use crate::models::{DayRecord, FootageDensity, HourRecord, ScanResult};
 use crate::naming::format_day_display;
 
-/// Scans a Wyze SD card `/record` directory in parallel using Rayon.
-/// Expects structure: `<source_dir>/YYYYMMDD/HH/MM.mp4` where `MM` is `00..=59`.
+/// Scans a Wyze SD card directory in parallel using Rayon.
+/// Adaptively supports:
+/// - Single hour folder (e.g. `.../11` containing `00.mp4`..`59.mp4`)
+/// - Single day folder (e.g. `.../20241020` containing `HH/MM.mp4`)
+/// - SD card root containing a `record` folder
+/// - Standard Wyze directory: `<source_dir>/YYYYMMDD/HH/MM.mp4`
+/// - Parent folder containing hour subfolders
 pub fn scan_record_directory(source_dir: &str) -> Result<ScanResult, StitcherError> {
     let started = Instant::now();
     let root = PathBuf::from(source_dir);
@@ -22,29 +27,7 @@ pub fn scan_record_directory(source_dir: &str) -> Result<ScanResult, StitcherErr
         });
     }
 
-    let mut day_entries: Vec<(String, PathBuf)> = fs::read_dir(&root)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = entry.file_name().into_string().ok()?;
-            if is_valid_day_dir(&name) {
-                Some((name, path))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    day_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    // Scan each day directory concurrently across Rayon worker threads.
-    let days: Vec<DayRecord> = day_entries
-        .into_par_iter()
-        .map(|(day, day_path)| scan_day_folder(day, &day_path))
-        .collect::<Result<Vec<_>, _>>()?;
+    let days = discover_and_scan_hierarchy(&root)?;
 
     let mut total_hours: u32 = 0;
     let mut total_clips: u32 = 0;
@@ -65,6 +48,110 @@ pub fn scan_record_directory(source_dir: &str) -> Result<ScanResult, StitcherErr
     })
 }
 
+fn discover_and_scan_hierarchy(root: &Path) -> Result<Vec<DayRecord>, StitcherError> {
+    // Case 1: The user selected an hour directory directly (e.g. ".../11" with "00.mp4"..."59.mp4")
+    if has_minute_clips(root) {
+        let hour = extract_hour_from_name(root.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+            .unwrap_or_else(|| "00".to_string());
+        let day = get_day_for_folder(root);
+        let hour_record = scan_hour_folder(hour, root)?;
+        let formatted_day = format_day_display(&day);
+        return Ok(vec![DayRecord {
+            day,
+            formatted_day,
+            hours: vec![hour_record],
+        }]);
+    }
+
+    // Case 2: SD card root containing a "record" folder
+    let record_sub = root.join("record");
+    if record_sub.is_dir() && !has_minute_clips(root) {
+        let sub_days = discover_and_scan_hierarchy(&record_sub)?;
+        if !sub_days.is_empty() {
+            return Ok(sub_days);
+        }
+    }
+
+    // Case 3: The directory contains hour subfolders directly (e.g. ".../20241020" or user folder with "11", "12", etc.)
+    let mut hour_entries = Vec::new();
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if let Some(hour) = extract_hour_from_name(name) {
+                        if has_minute_clips(&p) {
+                            hour_entries.push((hour, p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !hour_entries.is_empty() {
+        hour_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let day = get_day_for_folder(root);
+        let hours: Vec<HourRecord> = hour_entries
+            .into_par_iter()
+            .map(|(hour, hour_path)| scan_hour_folder(hour, &hour_path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let formatted_day = format_day_display(&day);
+        return Ok(vec![DayRecord {
+            day,
+            formatted_day,
+            hours,
+        }]);
+    }
+
+    // Case 4: Standard Wyze folder containing YYYYMMDD subfolders
+    let mut day_entries: Vec<(String, PathBuf)> = fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().into_string().ok()?;
+            if is_valid_day_dir(&name) {
+                Some((name, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !day_entries.is_empty() {
+        day_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let days: Vec<DayRecord> = day_entries
+            .into_par_iter()
+            .map(|(day, day_path)| scan_day_folder(day, &day_path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let valid_days: Vec<DayRecord> = days.into_iter().filter(|d| !d.hours.is_empty()).collect();
+        if !valid_days.is_empty() {
+            return Ok(valid_days);
+        }
+    }
+
+    // Case 5: Shallow inspection of immediate subdirectories
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.starts_with('.') && !name.starts_with('$') {
+                    if let Ok(sub_days) = discover_and_scan_hierarchy(&p) {
+                        if !sub_days.is_empty() {
+                            return Ok(sub_days);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(vec![])
+}
+
 fn scan_day_folder(day: String, day_path: &Path) -> Result<DayRecord, StitcherError> {
     let mut hour_entries: Vec<(String, PathBuf)> = fs::read_dir(day_path)?
         .filter_map(|entry| entry.ok())
@@ -74,8 +161,8 @@ fn scan_day_folder(day: String, day_path: &Path) -> Result<DayRecord, StitcherEr
                 return None;
             }
             let name = entry.file_name().into_string().ok()?;
-            if is_valid_hour_dir(&name) {
-                Some((name, path))
+            if let Some(hour) = extract_hour_from_name(&name) {
+                Some((hour, path))
             } else {
                 None
             }
@@ -140,6 +227,84 @@ fn scan_hour_folder(hour: String, hour_path: &Path) -> Result<HourRecord, Stitch
         density,
         has_non_aac_audio,
     })
+}
+
+pub fn has_minute_clips(dir: &Path) -> bool {
+    if let Ok(entries) = fs::read_dir(dir) {
+        entries.flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| parse_minute_clip_name(s))
+                .is_some()
+        })
+    } else {
+        false
+    }
+}
+
+pub fn extract_hour_from_name(name: &str) -> Option<String> {
+    if is_valid_hour_dir(name) {
+        return Some(name.to_string());
+    }
+    let first = name.split_whitespace().next().unwrap_or("");
+    if is_valid_hour_dir(first) {
+        return Some(first.to_string());
+    }
+    None
+}
+
+fn get_day_for_folder(dir: &Path) -> String {
+    // 1. Folder name is 8-digit date
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        if is_valid_day_dir(name) {
+            return name.to_string();
+        }
+    }
+    // 2. Parent folder name is 8-digit date
+    if let Some(parent) = dir.parent() {
+        if let Some(name) = parent.file_name().and_then(|n| n.to_str()) {
+            if is_valid_day_dir(name) {
+                return name.to_string();
+            }
+        }
+    }
+    // 3. Inspect modified date of the clips
+    if let Some(date_str) = find_clip_mtime_date(dir) {
+        return date_str;
+    }
+    // 4. Default to today
+    chrono::Local::now().format("%Y%m%d").to_string()
+}
+
+fn find_clip_mtime_date(dir: &Path) -> Option<String> {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().map(|e| e == "mp4").unwrap_or(false) {
+                if let Ok(meta) = p.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        let dt: chrono::DateTime<chrono::Local> = mtime.into();
+                        return Some(dt.format("%Y%m%d").to_string());
+                    }
+                }
+            } else if p.is_dir() {
+                if let Ok(sub) = fs::read_dir(&p) {
+                    for sub_entry in sub.flatten() {
+                        let sub_p = sub_entry.path();
+                        if sub_p.is_file() && sub_p.extension().map(|e| e == "mp4").unwrap_or(false) {
+                            if let Ok(meta) = sub_p.metadata() {
+                                if let Ok(mtime) = meta.modified() {
+                                    let dt: chrono::DateTime<chrono::Local> = mtime.into();
+                                    return Some(dt.format("%Y%m%d").to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_valid_day_dir(name: &str) -> bool {
@@ -281,5 +446,61 @@ mod tests {
         assert_eq!(result.days[0].hours[0].density, FootageDensity::SevereGaps);
         assert_eq!(result.days[0].hours[0].missing_minutes.len(), 56);
         assert!(result.days[0].hours[0].missing_minutes.contains(&"03".to_string()));
+    }
+
+    #[test]
+    fn scans_direct_hour_directory() {
+        let dir = tempdir().unwrap();
+        let hour_dir = dir.path().join("11");
+        fs::create_dir_all(&hour_dir).unwrap();
+
+        for m in 0..60 {
+            fs::write(hour_dir.join(format!("{m:02}.mp4")), b"stub").unwrap();
+        }
+
+        let result = scan_record_directory(hour_dir.to_str().unwrap()).unwrap();
+        assert_eq!(result.total_days, 1);
+        assert_eq!(result.total_hours, 1);
+        assert_eq!(result.total_clips, 60);
+        assert_eq!(result.days[0].hours[0].hour, "11");
+        assert_eq!(result.days[0].hours[0].density, FootageDensity::Complete);
+        assert!(result.days[0].hours[0].missing_minutes.is_empty());
+    }
+
+    #[test]
+    fn scans_direct_day_directory() {
+        let dir = tempdir().unwrap();
+        let day_dir = dir.path().join("20241020");
+        let hour_dir = day_dir.join("14");
+        fs::create_dir_all(&hour_dir).unwrap();
+
+        for m in 0..30 {
+            fs::write(hour_dir.join(format!("{m:02}.mp4")), b"stub").unwrap();
+        }
+
+        let result = scan_record_directory(day_dir.to_str().unwrap()).unwrap();
+        assert_eq!(result.total_days, 1);
+        assert_eq!(result.total_hours, 1);
+        assert_eq!(result.total_clips, 30);
+        assert_eq!(result.days[0].day, "20241020");
+        assert_eq!(result.days[0].hours[0].hour, "14");
+    }
+
+    #[test]
+    fn scans_sd_card_root_with_record_dir() {
+        let dir = tempdir().unwrap();
+        let hour_dir = dir.path().join("record").join("20241020").join("09");
+        fs::create_dir_all(&hour_dir).unwrap();
+
+        for m in 0..10 {
+            fs::write(hour_dir.join(format!("{m:02}.mp4")), b"stub").unwrap();
+        }
+
+        let result = scan_record_directory(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(result.total_days, 1);
+        assert_eq!(result.total_hours, 1);
+        assert_eq!(result.total_clips, 10);
+        assert_eq!(result.days[0].day, "20241020");
+        assert_eq!(result.days[0].hours[0].hour, "09");
     }
 }

@@ -17,7 +17,7 @@ use crate::models::{
     StitchJobSnapshot, StitchOptions,
 };
 use crate::naming::format_output_filename;
-use crate::scanner::detect_non_aac_audio;
+use crate::scanner::{detect_non_aac_audio, extract_hour_from_name, has_minute_clips};
 
 struct InternalJob {
     snapshot: StitchJobSnapshot,
@@ -286,16 +286,21 @@ async fn execute_single_job(
         false,
     );
 
-    let hour_folder = PathBuf::from(&options.source_dir).join(&day).join(&hour);
-    if !hour_folder.exists() || !hour_folder.is_dir() {
-        fail_job(
-            state,
-            listener,
-            job_id,
-            format!("Hour directory does not exist: {}", hour_folder.display()),
-        );
-        return;
-    }
+    let hour_folder = match resolve_hour_folder(&options.source_dir, &day, &hour) {
+        Some(p) => p,
+        None => {
+            fail_job(
+                state,
+                listener,
+                job_id,
+                format!(
+                    "Hour directory could not be resolved for day {day}, hour {hour} in {}",
+                    options.source_dir
+                ),
+            );
+            return;
+        }
+    };
 
     // Resolve ordered list of clip filenames.
     let mut clip_filenames: Vec<String> = match selected_clips {
@@ -336,9 +341,19 @@ async fn execute_single_job(
 
     let output_filename = format_output_filename(&day, &hour, options.naming_format);
     let final_output = if options.use_same_folder {
-        PathBuf::from(&options.source_dir)
-            .join(&day)
-            .join(&output_filename)
+        let day_dir = PathBuf::from(&options.source_dir).join(&day);
+        let target_dir = if day_dir.is_dir() {
+            day_dir
+        } else if let Some(parent) = hour_folder.parent() {
+            if parent.starts_with(&options.source_dir) && parent.is_dir() {
+                parent.to_path_buf()
+            } else {
+                PathBuf::from(&options.source_dir)
+            }
+        } else {
+            PathBuf::from(&options.source_dir)
+        };
+        target_dir.join(&output_filename)
     } else {
         let dest_dir = PathBuf::from(options.custom_output_dir.as_deref().unwrap_or(""));
         if !dest_dir.exists() {
@@ -691,4 +706,71 @@ fn mark_cancelled(
     };
     listener.on_job_log(job_id.to_string(), line, false);
     listener.on_job_updated(snap);
+}
+
+fn resolve_hour_folder(source_dir: &str, day: &str, hour: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(source_dir);
+
+    // 1. Direct hour folder (e.g. source_dir is ".../11")
+    if has_minute_clips(&root) {
+        return Some(root);
+    }
+
+    // 2. Standard Wyze: root/day/hour
+    let standard = root.join(day).join(hour);
+    if standard.is_dir() && has_minute_clips(&standard) {
+        return Some(standard);
+    }
+
+    // 3. SD card root with record/: root/record/day/hour
+    let record_standard = root.join("record").join(day).join(hour);
+    if record_standard.is_dir() && has_minute_clips(&record_standard) {
+        return Some(record_standard);
+    }
+
+    // 4. Day folder directly selected: root/hour
+    let direct_hour = root.join(hour);
+    if direct_hour.is_dir() && has_minute_clips(&direct_hour) {
+        return Some(direct_hour);
+    }
+
+    // 5. Look for matching hour folder in immediate subdirectories of root
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if extract_hour_from_name(name).as_deref() == Some(hour) && has_minute_clips(&p) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Look for matching hour folder inside root/record
+    let record_dir = root.join("record");
+    if record_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&record_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let sub_hour = p.join(hour);
+                    if sub_hour.is_dir() && has_minute_clips(&sub_hour) {
+                        return Some(sub_hour);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallbacks if directory exists
+    if standard.is_dir() {
+        return Some(standard);
+    }
+    if direct_hour.is_dir() {
+        return Some(direct_hour);
+    }
+
+    None
 }
