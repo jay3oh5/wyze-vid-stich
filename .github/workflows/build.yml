@@ -1,0 +1,45 @@
+name: Build & Package macOS App
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build macOS Universal App
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Run Rust unit tests
+        run: cargo test --workspace --verbose
+
+      - name: Build XCFramework & Swift Bindings
+        run: |
+          chmod +x scripts/build-xcframework.sh
+          ./scripts/build-xcframework.sh
+
+      - name: Package Native macOS App (.dmg & .zip)
+        run: |
+          chmod +x scripts/package-app.sh
+          ./scripts/package-app.sh
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WyzeVidStitch-macOS-Universal
+          path: |
+            dist/WyzeVidStitch-macOS.dmg
+            dist/WyzeVidStitch-macOS.zip
+          retention-days: 14
