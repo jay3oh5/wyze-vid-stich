@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct LogConsoleView: View {
+    @Environment(\.colorScheme) private var colorScheme
     let logs: [String]
 
     var body: some View {
@@ -18,14 +19,14 @@ struct LogConsoleView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(10)
             }
-            .frame(maxHeight: 150)
+            .frame(maxHeight: 160)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor))
+                    .fill(StudioTheme.elevatedSurface(for: colorScheme))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                    .strokeBorder(StudioTheme.hairlineBorder(for: colorScheme), lineWidth: 1)
             )
             .onChange(of: logs.count) { _, newCount in
                 if newCount > 0 {

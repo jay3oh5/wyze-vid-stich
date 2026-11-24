@@ -1,50 +1,68 @@
-import { useState, useEffect, useRef } from 'react';
-import { 
-  Video, 
-  FolderOpen, 
-  Play, 
-  Check, 
-  AlertTriangle, 
-  AlertCircle, 
-  ChevronRight, 
-  RefreshCw, 
-  Layers,
-  Sparkles
-} from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { AlertCircle, CheckCircle2, RefreshCw, Play, FolderOpen, X } from 'lucide-react';
+import { TopBar } from './components/TopBar';
+import { Sidebar } from './components/Sidebar';
+import { CinemaPreviewStage } from './components/CinemaPreviewStage';
+import { Timeline24h } from './components/Timeline24h';
+import { HourPreviewGrid } from './components/HourPreviewGrid';
+import { TheaterModal } from './components/TheaterModal';
+import { ClipInspectorModal } from './components/ClipInspectorModal';
+import { RenderQueueView } from './components/RenderQueueView';
+import { SettingsView } from './components/SettingsView';
+import { FolderBrowserModal } from './components/FolderBrowserModal';
+import { ConfirmDialog } from './components/ConfirmDialog';
+import {
+  formatDateDisplay,
+  formatHour12,
+  formatBytes,
+  getDaySummary,
+  formatOutputLabel
+} from './utils/footage';
 
 function App() {
-  // Load initial states from LocalStorage or fall back to default settings
-  const [sourceDir, setSourceDir] = useState(() => {
-    return localStorage.getItem('wyze_sourceDir') || './mock_record';
-  });
+  // Persistent Settings
+  const [sourceDir, setSourceDir] = useState(() => localStorage.getItem('wyze_sourceDir') || './mock_record');
   const [useSameFolder, setUseSameFolder] = useState(() => {
     const val = localStorage.getItem('wyze_useSameFolder');
-    return val === null ? true : val === 'true';
+    return val === null ? false : val === 'true';
   });
-  const [customOutputDir, setCustomOutputDir] = useState(() => {
-    return localStorage.getItem('wyze_customOutputDir') || '';
-  });
-  const [overwrite, setOverwrite] = useState(() => {
-    const val = localStorage.getItem('wyze_overwrite');
-    return val === 'true';
-  });
-  const [deleteAfterCompile, setDeleteAfterCompile] = useState(() => {
-    return localStorage.getItem('wyze_deleteAfterCompile') === 'true';
-  });
-  const [autoOpenFolder, setAutoOpenFolder] = useState(() => {
-    return localStorage.getItem('wyze_autoOpenFolder') === 'true';
-  });
-  const [sendNotification, setSendNotification] = useState(() => {
-    return localStorage.getItem('wyze_sendNotification') === 'true';
-  });
+  const [customOutputDir, setCustomOutputDir] = useState(
+    () => localStorage.getItem('wyze_customOutputDir') || './stitched_output'
+  );
+  const [overwrite, setOverwrite] = useState(() => localStorage.getItem('wyze_overwrite') === 'true');
+  const [deleteAfterCompile, setDeleteAfterCompile] = useState(
+    () => localStorage.getItem('wyze_deleteAfterCompile') === 'true'
+  );
+  const [autoOpenFolder, setAutoOpenFolder] = useState(
+    () => localStorage.getItem('wyze_autoOpenFolder') === 'true'
+  );
+  const [sendNotification, setSendNotification] = useState(
+    () => localStorage.getItem('wyze_sendNotification') === 'true'
+  );
 
+  // Navigation & UI state
+  const [activeTab, setActiveTab] = useState('library');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  // Scanned library state
   const [days, setDays] = useState([]);
-  const [scanning, setScanning] = useState(false);
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [stitchedOutputs, setStitchedOutputs] = useState([]);
+  const [scanning, setScanning] = useState(true);
   const [scanError, setScanError] = useState('');
-  
-  const [expandedDays, setExpandedDays] = useState(new Set());
   const [selectedHours, setSelectedHours] = useState(new Set());
-  
+
+  // Large Cinema Preview Stage & Theater Modal state
+  const [previewState, setPreviewState] = useState(null);
+  const [theaterOpen, setTheaterOpen] = useState(false);
+
+  // Modals state
+  const [inspectTarget, setInspectTarget] = useState(null); // { day, hourObj }
+  const [folderBrowserTarget, setFolderBrowserTarget] = useState(null); // 'source' | 'output' | null
+  const [confirmState, setConfirmState] = useState(null);
+
+  // Stitching queue state
   const [stitching, setStitching] = useState(false);
   const [status, setStatus] = useState({
     running: false,
@@ -56,20 +74,20 @@ function App() {
     errors: []
   });
 
-  // Video player state
-  const [activeVideoPath, setActiveVideoPath] = useState(null);
-  const [activeVideoTitle, setActiveVideoTitle] = useState('');
-
-  // Inspector state
-  const [inspectingDay, setInspectingDay] = useState(null);
-  const [inspectingHour, setInspectingHour] = useState(null);
-  const [inspectorClips, setInspectorClips] = useState(new Set());
-
   const pollIntervalRef = useRef(null);
-  const consoleEndRef = useRef(null);
   const prevRunningJobsRef = useRef(new Set());
 
-  // Sync settings changes to LocalStorage
+  const showToast = useCallback((type, message) => {
+    setToast({ type, message });
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 4500);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Persist settings
   useEffect(() => {
     localStorage.setItem('wyze_sourceDir', sourceDir);
     localStorage.setItem('wyze_useSameFolder', useSameFolder.toString());
@@ -78,79 +96,108 @@ function App() {
     localStorage.setItem('wyze_deleteAfterCompile', deleteAfterCompile.toString());
     localStorage.setItem('wyze_autoOpenFolder', autoOpenFolder.toString());
     localStorage.setItem('wyze_sendNotification', sendNotification.toString());
-  }, [sourceDir, useSameFolder, customOutputDir, overwrite, deleteAfterCompile, autoOpenFolder, sendNotification]);
+  }, [
+    sourceDir,
+    useSameFolder,
+    customOutputDir,
+    overwrite,
+    deleteAfterCompile,
+    autoOpenFolder,
+    sendNotification
+  ]);
 
-  // Auto scroll terminal logs
   useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [status.logs]);
-
-  // Request notifications permission on settings mount/toggle
-  useEffect(() => {
-    if (sendNotification && Notification.permission === 'default') {
+    if (sendNotification && typeof Notification !== 'undefined' && Notification.permission === 'default') {
       Notification.requestPermission();
     }
   }, [sendNotification]);
 
-  // Poll status when stitching is active
-  useEffect(() => {
-    if (stitching) {
-      pollIntervalRef.current = setInterval(fetchStatus, 600);
-    } else {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
-    }
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stitching]);
-
-  // Helper to format 24h string "HH" to 12h standard format "h:00 AM/PM"
-  const formatHour = (hourStr) => {
-    const h = parseInt(hourStr, 10);
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    const displayH = h % 12 === 0 ? 12 : h % 12;
-    return `${displayH}:00 ${ampm}`;
-  };
-
-  // Helper to format active compile item string "YYYYMMDD HH:00" to "YYYY-MM-DD h:00 AM/PM"
-  const formatCurrentItem = (item) => {
-    if (!item) return '';
-    const parts = item.split(' ');
-    if (parts.length === 2) {
-      const [day, hourMin] = parts;
-      const [hour] = hourMin.split(':');
-      const formattedDay = `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}`;
-      return `${formattedDay} ${formatHour(hour)}`;
-    }
-    return item;
-  };
-
-  const triggerNotification = (title, body) => {
-    if (sendNotification && Notification.permission === 'granted') {
-      new Notification(title, { body });
-    }
-  };
-
-  const handleOpenFolder = async (folderPath) => {
+  const handleOpenFolder = useCallback(async (folderPath) => {
     try {
-      await fetch('/api/open-folder', {
+      const res = await fetch('/api/open-folder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: folderPath })
       });
+      const data = await res.json();
+      if (res.ok && data.resolvedPath) {
+        showToast('info', `Output directory: ${data.resolvedPath}`);
+      }
     } catch (err) {
       console.error('Failed to open folder:', err);
     }
-  };
+  }, [showToast]);
 
-  const fetchStatus = async () => {
+  const refreshOutputs = useCallback(async (src = sourceDir, out = customOutputDir) => {
+    try {
+      const res = await fetch(
+        `/api/outputs?sourceDir=${encodeURIComponent(src)}&outputDir=${encodeURIComponent(out)}`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setStitchedOutputs(data.outputs || []);
+      }
+    } catch (err) {
+      console.error('Failed to load outputs:', err);
+    }
+  }, [sourceDir, customOutputDir]);
+
+  const handleScan = useCallback(async (overrideSourceDir) => {
+    const dirToScan = typeof overrideSourceDir === 'string' ? overrideSourceDir : sourceDir;
+    setScanning(true);
+    setScanError('');
+
+    try {
+      const response = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceDir: dirToScan,
+          outputDir: useSameFolder ? '' : customOutputDir
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to scan directory');
+      }
+
+      const scannedDays = data.days || [];
+      setDays(scannedDays);
+      setStitchedOutputs(data.stitchedOutputs || []);
+      setSelectedHours(new Set());
+
+      if (scannedDays.length > 0) {
+        const firstDay = scannedDays[0];
+        setSelectedDay(firstDay.day);
+        const firstHourWithClips = firstDay.hours.find(h => h.clips && h.clips.length > 0);
+        if (firstHourWithClips) {
+          const initialClip = firstHourWithClips.clips[0];
+          const clipPath =
+            firstHourWithClips.clipDetails?.[initialClip]?.path ||
+            `${firstHourWithClips.hourDirPath}/${initialClip}`;
+          setPreviewState({
+            mode: 'hour',
+            day: firstDay.day,
+            hourObj: firstHourWithClips,
+            clipFilename: initialClip,
+            videoPath: clipPath,
+            autoPlay: false
+          });
+        }
+      } else {
+        setSelectedDay(null);
+      }
+    } catch (err) {
+      setScanError(err.message);
+      setDays([]);
+      setSelectedDay(null);
+    } finally {
+      setScanning(false);
+    }
+  }, [sourceDir, useSameFolder, customOutputDir]);
+
+  const fetchStatus = useCallback(async () => {
     try {
       const response = await fetch('/api/status');
       if (!response.ok) throw new Error('Failed to query status');
@@ -158,28 +205,42 @@ function App() {
       setStatus(data);
 
       if (data.jobs && Array.isArray(data.jobs)) {
-        const runningJobs = data.jobs.filter(j => j.status === 'running');
-        
-        // Check for transition from running -> finished for notification/folder trigger
+        const runningJobs = data.jobs.filter(j => j.status === 'running' || j.status === 'pending');
+
         data.jobs.forEach(job => {
-          if (prevRunningJobsRef.current.has(job.id) && job.status !== 'running' && job.status !== 'pending') {
+          if (
+            prevRunningJobsRef.current.has(job.id) &&
+            job.status !== 'running' &&
+            job.status !== 'pending'
+          ) {
             if (job.status === 'completed') {
-              triggerNotification('Stitch Complete', `Successfully compiled ${formatHour(job.hour)} footage for ${job.day}.`);
+              showToast(
+                'success',
+                `Compiled ${formatDateDisplay(job.day)} · ${formatHour12(job.hour)} successfully.`
+              );
+              refreshOutputs();
+              if (
+                sendNotification &&
+                typeof Notification !== 'undefined' &&
+                Notification.permission === 'granted'
+              ) {
+                new Notification('Stitch Complete', {
+                  body: `Successfully compiled ${formatHour12(job.hour)} footage for ${job.day}.`
+                });
+              }
               if (autoOpenFolder) {
-                const folderToOpen = job.useSameFolder 
-                  ? `${job.sourceDir}/${job.day}` 
+                const folderToOpen = job.useSameFolder
+                  ? `${job.sourceDir}/${job.day}`
                   : job.outputDir;
                 handleOpenFolder(folderToOpen);
               }
             } else if (job.status === 'failed') {
-              triggerNotification('Stitch Failed', `Error compiling ${formatHour(job.hour)} for ${job.day}: ${job.error}`);
+              showToast('error', `Compilation failed for ${formatHour12(job.hour)}: ${job.error || 'Unknown error'}`);
             }
           }
         });
-        
-        // Update ref
-        const currentRunning = new Set(runningJobs.map(j => j.id));
-        prevRunningJobsRef.current = currentRunning;
+
+        prevRunningJobsRef.current = new Set(runningJobs.map(j => j.id));
       }
 
       if (!data.running) {
@@ -188,141 +249,170 @@ function App() {
     } catch (err) {
       console.error('Error fetching stitching status:', err);
     }
-  };
+  }, [autoOpenFolder, handleOpenFolder, refreshOutputs, sendNotification, showToast]);
 
-  const handleBrowseSource = async () => {
-    try {
-      const response = await fetch('/api/browse?prompt=Select Wyze Camera record folder');
-      if (!response.ok) throw new Error('Browse failed');
-      const data = await response.json();
-      if (!data.canceled && data.path) {
-        setSourceDir(data.path);
+  // Initial auto-scan & status sync on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sourceDir,
+            outputDir: useSameFolder ? '' : customOutputDir
+          })
+        });
+        const data = await response.json();
+        if (cancelled) return;
+        if (!response.ok) {
+          setScanError(data.error || 'Failed to scan directory');
+        } else {
+          const scannedDays = data.days || [];
+          setDays(scannedDays);
+          setStitchedOutputs(data.stitchedOutputs || []);
+          if (scannedDays.length > 0) {
+            const firstDay = scannedDays[0];
+            setSelectedDay(firstDay.day);
+            const firstHourWithClips = firstDay.hours.find(h => h.clips && h.clips.length > 0);
+            if (firstHourWithClips) {
+              const initialClip = firstHourWithClips.clips[0];
+              const clipPath =
+                firstHourWithClips.clipDetails?.[initialClip]?.path ||
+                `${firstHourWithClips.hourDirPath}/${initialClip}`;
+              setPreviewState({
+                mode: 'hour',
+                day: firstDay.day,
+                hourObj: firstHourWithClips,
+                clipFilename: initialClip,
+                videoPath: clipPath,
+                autoPlay: false
+              });
+            }
+          }
+        }
+      } catch (err) {
+        if (!cancelled) setScanError(err.message);
+      } finally {
+        if (!cancelled) setScanning(false);
       }
-    } catch (err) {
-      console.error('Error browsing source folder:', err);
-    }
-  };
 
-  const handleBrowseOutput = async () => {
-    try {
-      const response = await fetch('/api/browse?prompt=Select Custom Output Folder');
-      if (!response.ok) throw new Error('Browse failed');
-      const data = await response.json();
-      if (!data.canceled && data.path) {
-        setCustomOutputDir(data.path);
+      if (!cancelled) {
+        try {
+          const statusRes = await fetch('/api/status');
+          if (statusRes.ok && !cancelled) {
+            const statusData = await statusRes.json();
+            setStatus(statusData);
+            if (statusData.running) setStitching(true);
+          }
+        } catch (err) {
+          console.error('Initial status sync failed:', err);
+        }
       }
-    } catch (err) {
-      console.error('Error browsing output folder:', err);
-    }
-  };
+    })();
 
-  const handleScan = async () => {
-    setScanning(true);
-    setScanError('');
-    setDays([]);
-    setSelectedHours(new Set());
-    
-    try {
-      const response = await fetch('/api/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceDir })
-      });
-      
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to scan directory');
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Poll status while stitching
+  useEffect(() => {
+    if (stitching) {
+      pollIntervalRef.current = setInterval(fetchStatus, 500);
+    } else if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
       }
-      
-      setDays(data.days);
-      
-      // Auto-expand first day if available
-      if (data.days.length > 0) {
-        setExpandedDays(new Set([data.days[0].day]));
-      }
-    } catch (err) {
-      setScanError(err.message);
-    } finally {
-      setScanning(false);
-    }
-  };
+    };
+  }, [stitching, fetchStatus]);
 
-  const toggleDay = (day) => {
-    const next = new Set(expandedDays);
-    if (next.has(day)) {
-      next.delete(day);
-    } else {
-      next.add(day);
-    }
-    setExpandedDays(next);
-  };
-
+  // Selection helpers
   const toggleHour = (day, hour) => {
     const key = `${day}_${hour}`;
-    const next = new Set(selectedHours);
-    if (next.has(key)) {
-      next.delete(key);
-    } else {
-      next.add(key);
+    setSelectedHours(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const handleSelectAllDay = (dayObj) => {
+    setSelectedHours(prev => {
+      const next = new Set(prev);
+      dayObj.hours.forEach(h => next.add(`${dayObj.day}_${h.hour}`));
+      return next;
+    });
+  };
+
+  const handleSelectGapsDay = (dayObj) => {
+    setSelectedHours(prev => {
+      const next = new Set(prev);
+      dayObj.hours.forEach(h => {
+        if (h.missing.length > 0) next.add(`${dayObj.day}_${h.hour}`);
+        else next.delete(`${dayObj.day}_${h.hour}`);
+      });
+      return next;
+    });
+  };
+
+  const handleClearDaySelection = (dayObj) => {
+    setSelectedHours(prev => {
+      const next = new Set(prev);
+      dayObj.hours.forEach(h => next.delete(`${dayObj.day}_${h.hour}`));
+      return next;
+    });
+  };
+
+  // Preview helpers
+  const handleSelectMinuteClip = (day, hourObj, clipFilename, autoPlay = false) => {
+    const clipPath =
+      hourObj.clipDetails?.[clipFilename]?.path ||
+      `${hourObj.hourDirPath}/${clipFilename}`;
+    setPreviewState({
+      mode: 'hour',
+      day,
+      hourObj,
+      clipFilename,
+      videoPath: clipPath,
+      autoPlay
+    });
+    setActiveTab('library');
+  };
+
+  const handlePreviewHour = (day, hourObj, openTheaterImmediately = false) => {
+    if (!hourObj?.clips?.length) return;
+    const firstClip = hourObj.clips[0];
+    handleSelectMinuteClip(day, hourObj, firstClip, openTheaterImmediately);
+    if (openTheaterImmediately) {
+      setTheaterOpen(true);
     }
-    setSelectedHours(next);
   };
 
-  const handleDaySelectAll = (dayObj, e) => {
-    e.stopPropagation();
-    const next = new Set(selectedHours);
-    dayObj.hours.forEach(h => {
-      next.add(`${dayObj.day}_${h.hour}`);
+  const handlePlayStitchedOutput = (outputItem) => {
+    setPreviewState({
+      mode: 'compiled',
+      title: outputItem.title || formatOutputLabel(outputItem.name),
+      videoPath: outputItem.path,
+      sizeBytes: outputItem.sizeBytes,
+      autoPlay: true
     });
-    setSelectedHours(next);
+    setActiveTab('library');
   };
 
-  const handleDaySelectNone = (dayObj, e) => {
-    e.stopPropagation();
-    const next = new Set(selectedHours);
-    dayObj.hours.forEach(h => {
-      next.delete(`${dayObj.day}_${h.hour}`);
-    });
-    setSelectedHours(next);
-  };
-
-  const handleDaySelectGaps = (dayObj, e) => {
-    e.stopPropagation();
-    const next = new Set(selectedHours);
-    dayObj.hours.forEach(h => {
-      if (h.missing.length > 0) {
-        next.add(`${dayObj.day}_${h.hour}`);
-      } else {
-        next.delete(`${dayObj.day}_${h.hour}`);
-      }
-    });
-    setSelectedHours(next);
-  };
-
-  const handleStitch = async () => {
-    if (selectedHours.size === 0) return;
-
-    if (deleteAfterCompile) {
-      const confirmDelete = window.confirm("WARNING: 'Delete source clips after successful compile' is enabled. This will PERMANENTLY remove original files on your SD card once compiled. Are you sure you want to proceed?");
-      if (!confirmDelete) return;
-    }
-    
-    // Parse selection set back to structure
-    const hoursArray = Array.from(selectedHours).map(key => {
-      const [day, hour] = key.split('_');
-      return { day, hour };
-    });
+  // Submit stitching jobs
+  const executeStitchRequest = async (hoursArray) => {
+    const outputDirToUse = useSameFolder ? '' : (customOutputDir.trim() || './stitched_output');
 
     setStitching(true);
-    setStatus(prev => ({
-      ...prev,
-      running: true,
-      total: hoursArray.length,
-      current: 0,
-      currentItem: 'Initializing...',
-      logs: ['[System] Submitting compile jobs to queue...'],
-      errors: []
-    }));
+    setActiveTab('queue');
 
     try {
       const response = await fetch('/api/stitch', {
@@ -330,79 +420,78 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sourceDir,
-          outputDir: useSameFolder ? '' : customOutputDir,
+          outputDir: outputDirToUse,
           hours: hoursArray,
           overwrite,
           useSameFolder,
           deleteAfterCompile
         })
       });
-      
+
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || 'Failed to submit stitching jobs');
       }
-      
-      // Clear selections on success
+
       setSelectedHours(new Set());
-      
-      // Start polling status
-      fetchStatus();
-    } catch (err) {
-      setStitching(false);
-      setStatus(prev => ({
-        ...prev,
-        running: false,
-        logs: [...prev.logs, `[System] Job Submission Error: ${err.message}`],
-        errors: [...prev.errors, err.message]
-      }));
-    }
-  };
-
-  const handleStitchCustomSelection = async () => {
-    if (!inspectingDay || !inspectingHour || inspectorClips.size === 0) return;
-    
-    if (deleteAfterCompile) {
-      const confirmDelete = window.confirm("WARNING: 'Delete source clips after successful compile' is enabled. This will PERMANENTLY remove the selected source clips once compiled. Are you sure you want to proceed?");
-      if (!confirmDelete) return;
-    }
-    
-    const hoursArray = [{
-      day: inspectingDay,
-      hour: inspectingHour.hour,
-      clips: Array.from(inspectorClips)
-    }];
-    
-    setStitching(true);
-    handleCloseInspector();
-    
-    try {
-      const response = await fetch('/api/stitch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sourceDir,
-          outputDir: useSameFolder ? '' : customOutputDir,
-          hours: hoursArray,
-          overwrite,
-          useSameFolder,
-          deleteAfterCompile
-        })
-      });
-      
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to submit custom stitching job');
+      if (data.jobs) {
+        data.jobs.forEach(j => prevRunningJobsRef.current.add(j.id));
       }
-      
       fetchStatus();
     } catch (err) {
       setStitching(false);
-      alert(`Error starting custom compile: ${err.message}`);
+      showToast('error', err.message);
     }
   };
 
-  // Cancel pending/active job
+  const handleStitchSelected = () => {
+    if (selectedHours.size === 0 || stitching) return;
+    const hoursArray = Array.from(selectedHours)
+      .sort()
+      .map(key => {
+        const [day, hour] = key.split('_');
+        return { day, hour };
+      });
+
+    if (deleteAfterCompile) {
+      setConfirmState({
+        title: 'Confirm Destructive Source Cleanup',
+        message: `You are about to compile ${hoursArray.length} hour(s) and permanently delete the original 1-minute source clips afterward. Continue?`,
+        confirmLabel: 'Compile & Delete Originals',
+        destructive: true,
+        onConfirm: () => {
+          setConfirmState(null);
+          executeStitchRequest(hoursArray);
+        }
+      });
+      return;
+    }
+
+    executeStitchRequest(hoursArray);
+  };
+
+  const handleStitchCustomSelection = (day, hour, clips) => {
+    if (!clips || clips.length === 0) return;
+    setInspectTarget(null);
+
+    const hoursArray = [{ day, hour, clips }];
+    if (deleteAfterCompile) {
+      setConfirmState({
+        title: 'Confirm Destructive Source Cleanup',
+        message: `This will stitch ${clips.length} selected clip(s) and permanently delete those source clips on completion. Continue?`,
+        confirmLabel: 'Compile & Delete Originals',
+        destructive: true,
+        onConfirm: () => {
+          setConfirmState(null);
+          executeStitchRequest(hoursArray);
+        }
+      });
+      return;
+    }
+
+    executeStitchRequest(hoursArray);
+  };
+
   const handleCancelJob = async (id) => {
     try {
       const response = await fetch('/api/jobs/cancel', {
@@ -418,7 +507,6 @@ function App() {
     }
   };
 
-  // Clear completed/failed history
   const handleClearHistory = async () => {
     try {
       const response = await fetch('/api/jobs/clear', { method: 'POST' });
@@ -430,720 +518,348 @@ function App() {
     }
   };
 
-  // Inspector handlers
-  const handleOpenInspector = (day, hourObj, e) => {
-    e.stopPropagation();
-    setInspectingDay(day);
-    setInspectingHour(hourObj);
-    setInspectorClips(new Set(hourObj.clips));
-    
-    const dialog = document.getElementById('inspect-dialog');
-    if (dialog) {
-      dialog.showModal();
-    }
-  };
+  const activeDayObj = days.find(d => d.day === selectedDay) || days[0] || null;
+  const activeDaySummary = activeDayObj ? getDaySummary(activeDayObj) : null;
+  const activeJobsCount = (status.jobs || []).filter(
+    j => j.status === 'running' || j.status === 'pending'
+  ).length;
+  const activeRunningJob = (status.jobs || []).find(j => j.status === 'running');
 
-  const handleCloseInspector = () => {
-    const dialog = document.getElementById('inspect-dialog');
-    if (dialog) {
-      dialog.close();
-    }
-    setInspectingDay(null);
-    setInspectingHour(null);
-    setInspectorClips(new Set());
-  };
+  return (
+    <div className="min-h-screen flex flex-col bg-[#090b10] text-[#f4f6fa]">
+      <TopBar
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        selectedCount={selectedHours.size}
+        activeJobCount={activeJobsCount}
+        stitching={stitching}
+        scanning={scanning}
+        hasDays={days.length > 0}
+        onPrimaryAction={selectedHours.size > 0 ? handleStitchSelected : () => handleScan()}
+        onToggleMobileMenu={() => setMobileMenuOpen(v => !v)}
+      />
 
-  const toggleInspectorClip = (filename) => {
-    const next = new Set(inspectorClips);
-    if (next.has(filename)) {
-      next.delete(filename);
-    } else {
-      next.add(filename);
-    }
-    setInspectorClips(next);
-  };
+      {/* Compact Active Compile Strip when viewing Library/Settings */}
+      {activeRunningJob && activeTab !== 'queue' && (
+        <div className="bg-sky-500/10 border-b border-sky-400/20 px-4 lg:px-6 py-2 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2 text-sky-200 font-medium">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+            <span>
+              Compiling {formatDateDisplay(activeRunningJob.day)} · {formatHour12(activeRunningJob.hour)}
+            </span>
+            <span className="font-mono text-sky-300/80 tabular-nums">
+              ({activeRunningJob.currentClipIndex || 0}/{activeRunningJob.totalClips || 0} clips)
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveTab('queue')}
+            className="text-sky-300 hover:text-white font-semibold underline underline-offset-2 cursor-pointer"
+          >
+            View Queue
+          </button>
+        </div>
+      )}
 
-  const selectAllInspectorClips = () => {
-    if (inspectingHour) {
-      setInspectorClips(new Set(inspectingHour.clips));
-    }
-  };
+      {/* Workspace Body */}
+      <div className="flex-1 flex min-h-0">
+        <Sidebar
+          activeTab={activeTab}
+          onSelectTab={setActiveTab}
+          activeJobCount={activeJobsCount}
+          sourceDir={sourceDir}
+          days={days}
+          selectedDay={activeDayObj?.day || null}
+          onSelectDay={(dayStr) => {
+            setSelectedDay(dayStr);
+            setActiveTab('library');
+            const dayObj = days.find(d => d.day === dayStr);
+            const firstHour = dayObj?.hours?.find(h => h.clips?.length > 0);
+            if (firstHour) {
+              handlePreviewHour(dayStr, firstHour, false);
+            }
+          }}
+          stitchedOutputs={stitchedOutputs}
+          activePreviewPath={previewState?.videoPath || null}
+          onPlayStitchedOutput={handlePlayStitchedOutput}
+          onOpenBrowse={() => setFolderBrowserTarget('source')}
+          onScan={() => handleScan()}
+          scanning={scanning}
+          mobileOpen={mobileMenuOpen}
+          onCloseMobile={() => setMobileMenuOpen(false)}
+        />
 
-  const selectNoneInspectorClips = () => {
-    setInspectorClips(new Set());
-  };
+        <main className="flex-1 min-w-0 overflow-y-auto px-4 sm:px-6 lg:px-8 py-6">
+          <div className="max-w-6xl mx-auto space-y-6">
+            {/* Inline Toast Feedback */}
+            {toast && (
+              <div
+                role="status"
+                className={`px-4 py-3 rounded-xl border flex items-center justify-between gap-3 text-sm ${
+                  toast.type === 'error'
+                    ? 'bg-rose-500/10 border-rose-500/25 text-rose-200'
+                    : toast.type === 'success'
+                      ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-200'
+                      : 'bg-sky-500/10 border-sky-500/25 text-sky-200'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  {toast.type === 'error' ? (
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>{toast.message}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setToast(null)}
+                  aria-label="Dismiss notification"
+                  className="text-current/70 hover:text-current cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            )}
 
-  const handleDialogClick = (e) => {
-    const dialog = e.currentTarget;
-    const rect = dialog.getBoundingClientRect();
-    const isInDialog = (
-      rect.top <= e.clientY &&
-      e.clientY <= rect.top + rect.height &&
-      rect.left <= e.clientX &&
-      e.clientX <= rect.left + rect.width
-    );
-    if (!isInDialog) {
-      handleCloseInspector();
-    }
-  };
+            {/* LIBRARY VIEW */}
+            {activeTab === 'library' && (
+              <>
+                {scanError && (
+                  <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/25 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 text-sm text-rose-200">
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                      <span>{scanError}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setFolderBrowserTarget('source')}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.08] text-white hover:bg-white/[0.14] cursor-pointer"
+                    >
+                      Choose Another Folder
+                    </button>
+                  </div>
+                )}
 
-  // Rendering Helper Components
+                {scanning && days.length === 0 ? (
+                  <div className="space-y-6">
+                    <div className="h-[380px] rounded-xl bg-[#111520] border border-white/[0.08] animate-pulse" />
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      {[1, 2].map(n => (
+                        <div key={n} className="h-64 rounded-xl bg-[#111520] border border-white/[0.08] animate-pulse" />
+                      ))}
+                    </div>
+                  </div>
+                ) : !activeDayObj ? (
+                  <section className="bg-[#111520] border border-white/[0.08] rounded-xl p-12 text-center space-y-4">
+                    <div className="w-12 h-12 rounded-xl bg-white/[0.05] border border-white/[0.08] flex items-center justify-center text-sky-400 mx-auto">
+                      <FolderOpen className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h1 className="text-xl font-bold text-white">No Wyze Footage Loaded</h1>
+                      <p className="text-sm text-slate-400 mt-1.5 max-w-md mx-auto">
+                        Select your Wyze microSD card record folder (containing YYYYMMDD subdirectories) to preview and stitch footage.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setFolderBrowserTarget('source')}
+                        className="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-500 text-slate-950 hover:bg-sky-400 cursor-pointer"
+                      >
+                        Browse Folders
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleScan()}
+                        className="px-4 py-2 rounded-lg text-sm font-medium bg-white/[0.06] border border-white/[0.08] text-slate-200 hover:bg-white/[0.1] cursor-pointer"
+                      >
+                        Rescan Current Path
+                      </button>
+                    </div>
+                  </section>
+                ) : (
+                  <>
+                    {/* Day Header & Summary */}
+                    <div className="flex flex-wrap items-end justify-between gap-4">
+                      <div>
+                        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-[#f4f6fa]">
+                          {formatDateDisplay(activeDayObj.day, true)}
+                        </h1>
+                        {activeDaySummary && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-sm text-slate-400 tabular-nums">
+                            <span>{activeDaySummary.totalHours} recorded hours</span>
+                            <span aria-hidden="true">·</span>
+                            <span>{activeDaySummary.totalClips} clips</span>
+                            <span aria-hidden="true">·</span>
+                            <span>{activeDaySummary.coveragePct}% continuity</span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono">{formatBytes(activeDaySummary.totalSizeBytes)}</span>
+                          </div>
+                        )}
+                      </div>
 
-  // Renders a visual 24h timeline gap heatmap
-  const renderTimeline = (dayObj) => {
-    const hoursMap = new Map(dayObj.hours.map(h => [parseInt(h.hour, 10), h]));
-    const blocks = [];
-    
-    for (let h = 0; h < 24; h++) {
-      const hourObj = hoursMap.get(h);
-      const hourStr = h.toString().padStart(2, '0');
-      let statusClass = 'empty';
-      let tooltip = `${formatHour(hourStr)}: No footage`;
-      
-      if (hourObj) {
-        const count = hourObj.clipCount;
-        if (count === 60) {
-          statusClass = 'full';
-          tooltip = `${formatHour(hourStr)}: 60/60 clips (Complete)`;
-        } else if (count >= 30) {
-          statusClass = 'partial-high';
-          tooltip = `${formatHour(hourStr)}: ${count}/60 clips (Minor Gaps)`;
-        } else if (count > 0) {
-          statusClass = 'partial-low';
-          tooltip = `${formatHour(hourStr)}: ${count}/60 clips (Severe Gaps)`;
-        }
-      }
-      
-      blocks.push(
-        <div 
-          key={h} 
-          className={`timeline-block ${statusClass}`}
-          title={tooltip}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (hourObj) {
-              toggleHour(dayObj.day, hourObj.hour);
+                      {selectedHours.size > 0 && (
+                        <div className="flex items-center gap-3">
+                          <span className="text-xs text-slate-400 tabular-nums">
+                            {selectedHours.size} hour{selectedHours.size === 1 ? '' : 's'} ready to stitch
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleStitchSelected}
+                            disabled={stitching}
+                            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-sky-500 text-slate-950 hover:bg-sky-400 disabled:opacity-40 transition-colors cursor-pointer"
+                          >
+                            <Play className="w-4 h-4 fill-current" />
+                            <span>Stitch Selected</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Dominant Focal Anchor: Large Cinema Preview Stage */}
+                    <CinemaPreviewStage
+                      previewState={previewState}
+                      onSelectMinuteClip={handleSelectMinuteClip}
+                      onOpenTheater={() => setTheaterOpen(true)}
+                      onOpenInspector={(day, hourObj) => setInspectTarget({ day, hourObj })}
+                      isHourSelected={
+                        previewState?.mode === 'hour' && previewState?.hourObj
+                          ? selectedHours.has(`${previewState.day}_${previewState.hourObj.hour}`)
+                          : false
+                      }
+                      onToggleSelectHour={toggleHour}
+                    />
+
+                    {/* 24-Hour Coverage Timeline */}
+                    <Timeline24h
+                      dayObj={activeDayObj}
+                      activeHour={previewState?.mode === 'hour' ? previewState?.hourObj?.hour : null}
+                      selectedHours={selectedHours}
+                      onPreviewHour={(day, hourObj) => handlePreviewHour(day, hourObj, false)}
+                      onToggleSelectHour={toggleHour}
+                    />
+
+                    {/* Large Visual Hour Preview Grid */}
+                    <HourPreviewGrid
+                      dayObj={activeDayObj}
+                      selectedHours={selectedHours}
+                      activePreviewHour={previewState?.mode === 'hour' ? previewState?.hourObj?.hour : null}
+                      onToggleSelectHour={toggleHour}
+                      onSelectAllDay={handleSelectAllDay}
+                      onSelectGapsDay={handleSelectGapsDay}
+                      onClearDaySelection={handleClearDaySelection}
+                      onPreviewHour={(day, hourObj) => handlePreviewHour(day, hourObj, false)}
+                      onOpenTheaterForHour={(day, hourObj) => handlePreviewHour(day, hourObj, true)}
+                      onOpenInspector={(day, hourObj) => setInspectTarget({ day, hourObj })}
+                    />
+                  </>
+                )}
+              </>
+            )}
+
+            {/* RENDER QUEUE VIEW */}
+            {activeTab === 'queue' && (
+              <RenderQueueView
+                status={status}
+                stitching={stitching}
+                onPlayOutput={handlePlayStitchedOutput}
+                onOpenFolder={handleOpenFolder}
+                onCancelJob={handleCancelJob}
+                onClearHistory={handleClearHistory}
+                onGoToLibrary={() => setActiveTab('library')}
+              />
+            )}
+
+            {/* SETTINGS VIEW */}
+            {activeTab === 'settings' && (
+              <SettingsView
+                sourceDir={sourceDir}
+                onChangeSourceDir={setSourceDir}
+                useSameFolder={useSameFolder}
+                onChangeUseSameFolder={setUseSameFolder}
+                customOutputDir={customOutputDir}
+                onChangeCustomOutputDir={setCustomOutputDir}
+                overwrite={overwrite}
+                onChangeOverwrite={setOverwrite}
+                autoOpenFolder={autoOpenFolder}
+                onChangeAutoOpenFolder={setAutoOpenFolder}
+                sendNotification={sendNotification}
+                onChangeSendNotification={setSendNotification}
+                deleteAfterCompile={deleteAfterCompile}
+                onChangeDeleteAfterCompile={setDeleteAfterCompile}
+                onBrowseSource={() => setFolderBrowserTarget('source')}
+                onBrowseOutput={() => setFolderBrowserTarget('output')}
+                onScan={() => {
+                  handleScan();
+                  setActiveTab('library');
+                }}
+                scanning={scanning}
+                stitching={stitching}
+              />
+            )}
+          </div>
+        </main>
+      </div>
+
+      {/* Theater Lightbox Modal */}
+      {theaterOpen && previewState && (
+        <TheaterModal
+          previewState={previewState}
+          onClose={() => setTheaterOpen(false)}
+          onSelectMinuteClip={handleSelectMinuteClip}
+        />
+      )}
+
+      {/* Split-Pane Clip Inspector Modal */}
+      {inspectTarget && (
+        <ClipInspectorModal
+          day={inspectTarget.day}
+          hourObj={inspectTarget.hourObj}
+          stitching={stitching}
+          onClose={() => setInspectTarget(null)}
+          onStitchCustom={handleStitchCustomSelection}
+        />
+      )}
+
+      {/* Cross-Platform Directory Picker Modal */}
+      {folderBrowserTarget && (
+        <FolderBrowserModal
+          title={
+            folderBrowserTarget === 'source'
+              ? 'Select Wyze Record Source Folder'
+              : 'Select Destination Folder'
+          }
+          initialDir={folderBrowserTarget === 'source' ? sourceDir : (customOutputDir || '.')}
+          onClose={() => setFolderBrowserTarget(null)}
+          onSelect={(chosenPath) => {
+            if (folderBrowserTarget === 'source') {
+              setSourceDir(chosenPath);
+              setFolderBrowserTarget(null);
+              handleScan(chosenPath);
+              setActiveTab('library');
+            } else {
+              setCustomOutputDir(chosenPath);
+              setFolderBrowserTarget(null);
+              refreshOutputs(sourceDir, chosenPath);
             }
           }}
         />
-      );
-    }
-    
-    return (
-      <div className="day-timeline-container" onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '6px' }}>
-          <span>24-Hour Footage Timeline (12 AM - 11 PM)</span>
-          <span style={{ display: 'flex', gap: '8px' }}>
-            <span className="dot dot-full"></span> Complete
-            <span className="dot dot-gaps"></span> Gaps
-            <span className="dot dot-empty"></span> Empty
-          </span>
-        </div>
-        <div className="day-timeline-bar">
-          {blocks}
-        </div>
-      </div>
-    );
-  };
+      )}
 
-  // Renders the Clip Inspector dialog
-  const renderInspectorDialog = () => {
-    if (!inspectingDay || !inspectingHour) return null;
-    
-    const formattedDay = `${inspectingDay.slice(0, 4)}-${inspectingDay.slice(4, 6)}-${inspectingDay.slice(6, 8)}`;
-    const clipSet = new Set(inspectingHour.clips);
-    const minuteGridItems = [];
-    
-    for (let m = 0; m < 60; m++) {
-      const minStr = m.toString().padStart(2, '0');
-      const filename = `${minStr}.mp4`;
-      const exists = clipSet.has(filename);
-      const isChecked = inspectorClips.has(filename);
-      
-      minuteGridItems.push(
-        <label 
-          key={m} 
-          className={`inspector-minute-tile ${exists ? 'exists' : 'missing'} ${isChecked ? 'checked' : ''}`}
-        >
-          <input 
-            type="checkbox" 
-            checked={isChecked}
-            disabled={!exists}
-            onChange={() => toggleInspectorClip(filename)}
-            style={{ display: 'none' }}
-          />
-          <span className="minute-checkbox-indicator">
-            {exists ? (isChecked ? '✓' : '✕') : '✕'}
-          </span>
-          <span className="minute-num">{minStr}m</span>
-        </label>
-      );
-    }
-    
-    return (
-      <dialog id="inspect-dialog" className="glass-card inspect-modal" onClick={handleDialogClick}>
-        <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-          <div className="modal-header">
-            <div>
-              <h3>Inspect Footage: {formattedDay} Hour {formatHour(inspectingHour.hour)}</h3>
-              <p style={{ margin: '4px 0 0 0', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                {inspectingHour.clipCount} of 60 minutes present. Uncheck minute clips you wish to skip from compilation.
-              </p>
-            </div>
-            <button className="btn-close" onClick={handleCloseInspector}>&times;</button>
-          </div>
-          
-          <div className="modal-actions-bar">
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <button className="btn btn-secondary btn-small" onClick={selectAllInspectorClips}>Select All Available</button>
-              <button className="btn btn-secondary btn-small" onClick={selectNoneInspectorClips}>Clear All</button>
-            </div>
-            <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
-              {inspectorClips.size} / {inspectingHour.clipCount} clips selected
-            </span>
-          </div>
-          
-          <div className="inspector-minutes-grid">
-            {minuteGridItems}
-          </div>
-          
-          <div className="modal-footer">
-            <button className="btn btn-secondary" onClick={handleCloseInspector}>Close</button>
-            <button 
-              className="btn btn-primary" 
-              onClick={handleStitchCustomSelection}
-              disabled={inspectorClips.size === 0 || stitching}
-            >
-              Stitch Custom Selection ({inspectorClips.size} Mins)
-            </button>
-          </div>
-        </div>
-      </dialog>
-    );
-  };
-
-  // Renders the integrated floating Video Player
-  const renderVideoPlayer = () => {
-    if (!activeVideoPath) return null;
-    
-    return (
-      <div className="floating-player-overlay" onClick={() => setActiveVideoPath(null)}>
-        <div className="floating-player-card glass-card" onClick={(e) => e.stopPropagation()}>
-          <div className="player-header">
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              <h3 style={{ fontSize: '1.05rem', display: 'flex', alignItems: 'center', gap: '8px', margin: 0 }}>
-                <Video size={18} color="#0ea5e9" />
-                Footage Playback: {activeVideoTitle}
-              </h3>
-              <span className="player-file-path" title={activeVideoPath}>
-                {activeVideoPath.length > 50 ? '...' + activeVideoPath.slice(-47) : activeVideoPath}
-              </span>
-            </div>
-            <button className="btn-close" onClick={() => setActiveVideoPath(null)}>&times;</button>
-          </div>
-          <div className="player-body">
-            <video 
-              key={activeVideoPath}
-              src={`/api/video-stream?path=${encodeURIComponent(activeVideoPath)}`}
-              controls 
-              autoPlay 
-              className="player-video-element"
-            />
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // Renders the Multi-Job history board
-  const renderJobBoard = () => {
-    const jobs = status.jobs || [];
-    if (jobs.length === 0) return null;
-    
-    return (
-      <section className="glass-card">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-          <h2 style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Layers size={22} color="#0ea5e9" />
-            Compilation Jobs & History
-          </h2>
-          <button 
-            className="btn btn-secondary" 
-            style={{ padding: '6px 12px', fontSize: '0.8rem' }}
-            onClick={handleClearHistory}
-            disabled={stitching}
-          >
-            Clear History
-          </button>
-        </div>
-        
-        <div className="jobs-list">
-          {jobs.map(job => {
-            const isRunning = job.status === 'running';
-            const isPending = job.status === 'pending';
-            const isCompleted = job.status === 'completed';
-            const isFailed = job.status === 'failed';
-            
-            let statusBadgeClass = 'job-badge ';
-            if (isRunning) statusBadgeClass += 'running';
-            else if (isPending) statusBadgeClass += 'pending';
-            else if (isCompleted) statusBadgeClass += 'completed';
-            else if (isFailed) statusBadgeClass += 'failed';
-            
-            const progress = job.totalClips > 0 
-              ? Math.round((job.currentClipIndex / job.totalClips) * 100) 
-              : 0;
-
-            const formattedSize = job.fileSize 
-              ? `${(job.fileSize / (1024 * 1024)).toFixed(1)} MB` 
-              : 'N/A';
-              
-            return (
-              <div key={job.id} className={`job-row ${isRunning ? 'active' : ''}`}>
-                <div className="job-info-grid">
-                  <div className="job-main-desc">
-                    <span className={statusBadgeClass}>{job.status.toUpperCase()}</span>
-                    <strong>{job.day.slice(0,4)}-{job.day.slice(4,6)}-{job.day.slice(6,8)}</strong>
-                    <span>Hour {formatHour(job.hour)}</span>
-                  </div>
-                  
-                  <div className="job-metrics">
-                    {isCompleted && (
-                      <>
-                        <span>Size: {formattedSize}</span>
-                        <span>Duration: {((job.durationMs || 0)/1000).toFixed(1)}s</span>
-                      </>
-                    )}
-                    {(isRunning || isPending) && (
-                      <span>Clips: {job.currentClipIndex || 0} / {job.totalClips}</span>
-                    )}
-                    {isFailed && (
-                      <span style={{ color: 'var(--color-danger)' }}>Failed</span>
-                    )}
-                  </div>
-                  
-                  <div className="job-actions-col">
-                    {isRunning && (
-                      <button 
-                        className="btn btn-secondary btn-small danger-hover"
-                        onClick={() => handleCancelJob(job.id)}
-                      >
-                        Cancel
-                      </button>
-                    )}
-                    {isPending && (
-                      <button 
-                        className="btn btn-secondary btn-small danger-hover"
-                        onClick={() => handleCancelJob(job.id)}
-                      >
-                        Remove
-                      </button>
-                    )}
-                    {isCompleted && job.outputPath && (
-                      <div style={{ display: 'flex', gap: '8px' }}>
-                        <button 
-                          className="btn btn-primary btn-small"
-                          style={{ padding: '6px 12px', fontSize: '0.8rem' }}
-                          onClick={() => {
-                            setActiveVideoPath(job.outputPath);
-                            setActiveVideoTitle(`${job.day.slice(0,4)}-${job.day.slice(4,6)}-${job.day.slice(6,8)} Hour ${formatHour(job.hour)}`);
-                          }}
-                        >
-                          Play
-                        </button>
-                        <button 
-                          className="btn btn-secondary btn-small"
-                          style={{ padding: '6px 12px', fontSize: '0.8rem' }}
-                          onClick={() => handleOpenFolder(
-                            job.useSameFolder 
-                              ? `${job.sourceDir}/${job.day}` 
-                              : job.outputDir
-                          )}
-                        >
-                          Reveal
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                
-                {/* Granular Clip Progress Bar */}
-                {isRunning && (
-                  <div className="job-progress-wrapper" style={{ marginTop: '8px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>
-                      <span>Appending clip: {job.currentClipName || 'Initializing FFmpeg stream...'}</span>
-                      <span>{progress}%</span>
-                    </div>
-                    <div className="job-progress-bg">
-                      <div className="job-progress-fill" style={{ width: `${progress}%` }}></div>
-                    </div>
-                  </div>
-                )}
-                
-                {isFailed && job.error && (
-                  <div className="job-error-msg">
-                    <AlertTriangle size={14} />
-                    {job.error}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </section>
-    );
-  };
-
-  const progressPercentage = status.total > 0 
-    ? Math.round((status.current / status.total) * 100) 
-    : 0;
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '30px', width: '100%' }}>
-      
-      {/* Title & Badge */}
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
-        <div>
-          <h1>
-            <Video size={40} color="#0ea5e9" /> 
-            Wyze SD Card Video Stitcher
-          </h1>
-          <p style={{ marginTop: '6px' }}>Concatenate 1-minute camera recordings into lossless 1-hour files instantly using FFmpeg.</p>
-        </div>
-        <div className="header-badge">
-          <Sparkles size={16} /> Lossless Stream Copy
-        </div>
-      </header>
-
-      {/* Directory Settings Card */}
-      <section className="glass-card">
-        <h2 style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <FolderOpen size={22} color="#0ea5e9" />
-          Directory Configuration
-        </h2>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          
-          <div className="form-row">
-            <div className="form-group">
-              <label>Wyze Record Folder (Source)</label>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <input 
-                  type="text" 
-                  value={sourceDir} 
-                  onChange={(e) => setSourceDir(e.target.value)} 
-                  placeholder="e.g. /Volumes/SD_CARD/record"
-                />
-                <button 
-                  type="button"
-                  className="btn btn-secondary"
-                  onClick={handleBrowseSource}
-                  disabled={scanning || stitching}
-                  style={{ minWidth: '100px' }}
-                >
-                  Browse...
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '20px' }}>
-            <label className="checkbox-container">
-              <input 
-                type="checkbox" 
-                checked={useSameFolder} 
-                onChange={(e) => setUseSameFolder(e.target.checked)} 
-              />
-              <div className="checkmark"></div>
-              <span style={{ fontSize: '0.95rem', fontWeight: 500 }}>
-                Save compiled videos directly inside their original day folders (e.g. record/YYYYMMDD/HH.mp4)
-              </span>
-            </label>
-
-            {!useSameFolder && (
-              <div className="form-group" style={{ animation: 'fadeIn 0.25s ease' }}>
-                <label>Custom Destination Directory</label>
-                <div style={{ display: 'flex', gap: '10px' }}>
-                  <input 
-                    type="text" 
-                    value={customOutputDir} 
-                    onChange={(e) => setCustomOutputDir(e.target.value)} 
-                    placeholder="e.g. /Users/jd/Desktop/Stitched"
-                  />
-                  <button 
-                    type="button"
-                    className="btn btn-secondary"
-                    onClick={handleBrowseOutput}
-                    disabled={stitching}
-                    style={{ minWidth: '100px' }}
-                  >
-                    Browse...
-                  </button>
-                </div>
-              </div>
-            )}
-            
-            {/* Automation Options Toggles */}
-            <div className="settings-options-grid">
-              <label className="checkbox-container">
-                <input 
-                  type="checkbox" 
-                  checked={autoOpenFolder} 
-                  onChange={(e) => setAutoOpenFolder(e.target.checked)} 
-                />
-                <div className="checkmark"></div>
-                <span style={{ fontSize: '0.95rem', fontWeight: 500 }}>
-                  Auto-open output folder on success
-                </span>
-              </label>
-
-              <label className="checkbox-container">
-                <input 
-                  type="checkbox" 
-                  checked={sendNotification} 
-                  onChange={(e) => {
-                    setSendNotification(e.target.checked);
-                    if (e.target.checked) {
-                      Notification.requestPermission();
-                    }
-                  }} 
-                />
-                <div className="checkmark"></div>
-                <span style={{ fontSize: '0.95rem', fontWeight: 500 }}>
-                  Send system notification when job finishes
-                </span>
-              </label>
-
-              <label className="checkbox-container danger-label">
-                <input 
-                  type="checkbox" 
-                  checked={deleteAfterCompile} 
-                  onChange={(e) => setDeleteAfterCompile(e.target.checked)} 
-                />
-                <div className="checkmark"></div>
-                <span style={{ fontSize: '0.95rem', fontWeight: 500, color: 'var(--color-danger)' }}>
-                  Delete source clips after successful compile (Destructive)
-                </span>
-              </label>
-            </div>
-          </div>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px', marginTop: '10px' }}>
-            <button 
-              className="btn btn-primary" 
-              onClick={handleScan} 
-              disabled={scanning || stitching}
-            >
-              {scanning ? (
-                <>
-                  <RefreshCw className="accordion-arrow" style={{ animation: 'spin 1.5s linear infinite' }} size={18} />
-                  Scanning...
-                </>
-              ) : 'Scan Source Directory'}
-            </button>
-            
-            {scanError && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#ef4444', fontSize: '0.9rem' }}>
-                <AlertCircle size={18} />
-                {scanError}
-              </div>
-            )}
-          </div>
-        </div>
-      </section>
-
-      {/* Day Accordions & Hour Selection Grid */}
-      <section style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2>Select Footage to Stitch</h2>
-          <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
-            {selectedHours.size} hours selected
-          </span>
-        </div>
-
-        {days.length === 0 ? (
-          <div className="glass-card empty-state">
-            <Layers size={48} style={{ opacity: 0.3 }} />
-            <p>No directories scanned yet. Configure paths above and click "Scan Source Directory".</p>
-          </div>
-        ) : (
-          days.map(dayObj => {
-            const isOpen = expandedDays.has(dayObj.day);
-            return (
-              <div key={dayObj.day} className="day-accordion">
-                <div className="day-header" onClick={() => toggleDay(dayObj.day)}>
-                  <div className="day-info">
-                    <ChevronRight 
-                      className={`accordion-arrow ${isOpen ? 'open' : ''}`} 
-                      size={20} 
-                      color="var(--text-secondary)"
-                    />
-                    <h3 style={{ margin: 0 }}>{dayObj.formattedDay}</h3>
-                    <span style={{ fontSize: '0.85rem', background: 'rgba(255,255,255,0.05)', padding: '2px 8px', borderRadius: '12px', color: 'var(--text-secondary)' }}>
-                      {dayObj.hours.length} hours recorded
-                    </span>
-                  </div>
-                  
-                  {isOpen && (
-                    <div className="day-actions">
-                      <button 
-                        className="btn btn-secondary btn-small" 
-                        onClick={(e) => handleDaySelectAll(dayObj, e)}
-                      >
-                        Select All
-                      </button>
-                      <button 
-                        className="btn btn-secondary btn-small" 
-                        onClick={(e) => handleDaySelectGaps(dayObj, e)}
-                      >
-                        Select Gaps
-                      </button>
-                      <button 
-                        className="btn btn-secondary btn-small" 
-                        onClick={(e) => handleDaySelectNone(dayObj, e)}
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                {isOpen && (
-                  <div className="day-content">
-                    {/* Visual 24h Heatmap Timeline */}
-                    {renderTimeline(dayObj)}
-
-                    {/* Hour Blocks Grid */}
-                    <div className="hour-grid">
-                      {dayObj.hours.map(hourObj => {
-                        const isSel = selectedHours.has(`${dayObj.day}_${hourObj.hour}`);
-                        const hasGaps = hourObj.missing.length > 0;
-                        const severeGaps = hourObj.clipCount < 30;
-                        return (
-                          <div 
-                            key={hourObj.hour} 
-                            className={`hour-tile ${isSel ? 'selected' : ''}`}
-                            onClick={() => toggleHour(dayObj.day, hourObj.hour)}
-                          >
-                            {hasGaps && (
-                              <div 
-                                className={`warning-badge ${severeGaps ? 'severe' : ''}`}
-                                title={`Missing ${hourObj.missing.length} clips`}
-                              />
-                            )}
-                            <div className="hour-number">{formatHour(hourObj.hour)}</div>
-                            <div className="hour-stats">{hourObj.clipCount}/60 clips</div>
-                            
-                            <button
-                              className="btn-inspect-tile"
-                              title="Inspect and exclude individual clips"
-                              onClick={(e) => handleOpenInspector(dayObj.day, hourObj, e)}
-                            >
-                              Inspect
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })
-        )}
-      </section>
-
-      {/* Control Actions & Stitch Execution */}
-      <section className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '20px' }}>
-          
-          <label className="checkbox-container">
-            <input 
-              type="checkbox" 
-              checked={overwrite} 
-              onChange={(e) => setOverwrite(e.target.checked)} 
-            />
-            <div className="checkmark"></div>
-            <span>Overwrite existing output files</span>
-          </label>
-
-          <button 
-            className="btn btn-primary" 
-            style={{ padding: '14px 32px', fontSize: '1.05rem', minWidth: '240px' }}
-            disabled={selectedHours.size === 0 || stitching}
-            onClick={handleStitch}
-          >
-            <Play size={18} fill="#000" />
-            Stitch Selected ({selectedHours.size} Hours)
-          </button>
-        </div>
-
-        {/* Global Progress Bar for legacy / fallback status UI */}
-        {(stitching || (status.logs && status.logs.length > 0 && !status.jobs?.length)) && (
-          <div className="progress-container" style={{ marginTop: '10px' }}>
-            <div className="progress-header-info">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {status.running ? (
-                  <RefreshCw className="accordion-arrow" style={{ animation: 'spin 1.5s linear infinite' }} size={16} color="#0ea5e9" />
-                ) : (
-                  <Check size={18} color="#10b981" />
-                )}
-                <span>
-                  {status.running 
-                    ? `Compiling: ${formatCurrentItem(status.currentItem)}` 
-                    : status.errors.length > 0 
-                      ? 'Compiles Finished with Warnings/Errors' 
-                      : 'All Compiles Completed Successfully'}
-                </span>
-              </div>
-              <span>{status.current} / {status.total} Folders ({progressPercentage}%)</span>
-            </div>
-
-            <div className="progress-bar-bg">
-              <div className="progress-bar-fill" style={{ width: `${progressPercentage}%` }}></div>
-            </div>
-
-            <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              <label>Real-Time Activity Log</label>
-              <div className="log-console">
-                {status.logs.map((log, index) => {
-                  let logClass = 'log-line';
-                  if (log.includes('ERROR:')) logClass += ' error';
-                  else if (log.includes('WARNING:') || log.includes('Skipped:')) logClass += ' warning';
-                  return (
-                    <div key={index} className={logClass}>
-                      {log}
-                    </div>
-                  );
-                })}
-                <div ref={consoleEndRef} />
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* Modern Multi-Job Queue & History Log */}
-      {renderJobBoard()}
-
-      {/* Overlays / Modals */}
-      {renderInspectorDialog()}
-      {renderVideoPlayer()}
-
-      {/* Embedded Animation Keyframes */}
-      <style>{`
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(-4px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
-
+      {/* Destructive Action Confirmation Dialog */}
+      {confirmState && (
+        <ConfirmDialog
+          title={confirmState.title}
+          message={confirmState.message}
+          confirmLabel={confirmState.confirmLabel}
+          destructive={confirmState.destructive}
+          onConfirm={confirmState.onConfirm}
+          onCancel={() => setConfirmState(null)}
+        />
+      )}
     </div>
   );
 }
 
 export default App;
-

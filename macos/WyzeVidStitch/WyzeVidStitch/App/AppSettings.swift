@@ -60,6 +60,8 @@ final class AppSettings: ObservableObject {
     @AppStorage("wyze_sendNotifications") var sendNotifications: Bool = true
     @AppStorage("wyze_namingFormat") var namingFormatRaw: String = NamingPreference.twentyFourHour.rawValue
     @AppStorage("wyze_appearanceMode") var appearanceModeRaw: String = AppearanceMode.auto.rawValue
+    @AppStorage("wyze_previewSize") var previewSizeRaw: String = HourPreviewSize.large.rawValue
+    @AppStorage("wyze_autoAdvancePreview") var autoAdvancePreview: Bool = true
 
     var namingPreference: NamingPreference {
         get { NamingPreference(rawValue: namingFormatRaw) ?? .twentyFourHour }
@@ -69,6 +71,11 @@ final class AppSettings: ObservableObject {
     var appearanceMode: AppearanceMode {
         get { AppearanceMode(rawValue: appearanceModeRaw) ?? .auto }
         set { appearanceModeRaw = newValue.rawValue }
+    }
+
+    var previewSize: HourPreviewSize {
+        get { HourPreviewSize(rawValue: previewSizeRaw) ?? .large }
+        set { previewSizeRaw = newValue.rawValue }
     }
 
     func toStitchOptions() -> StitchOptions {

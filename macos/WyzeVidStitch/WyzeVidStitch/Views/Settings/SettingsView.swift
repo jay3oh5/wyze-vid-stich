@@ -30,7 +30,7 @@ struct SettingsView: View {
 
             appearanceTab
                 .tabItem {
-                    Label("Appearance", systemImage: "circle.lefthalf.filled")
+                    Label("Appearance & Previews", systemImage: "circle.lefthalf.filled")
                 }
 
             automationTab
@@ -38,7 +38,7 @@ struct SettingsView: View {
                     Label("Automation & Safety", systemImage: "bell.badge")
                 }
         }
-        .frame(width: 540, height: 340)
+        .frame(width: 560, height: 390)
         .padding(16)
     }
 
@@ -101,6 +101,21 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
 
                 Text("Defaults to Auto to adapt seamlessly with macOS Light and Dark Mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Video Previews") {
+                Picker("Default Hour Card Size", selection: $settings.previewSize) {
+                    ForEach(HourPreviewSize.allCases) { size in
+                        Text(size.label).tag(size)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Toggle("Auto-advance between 1-minute clips during preview", isOn: $settings.autoAdvancePreview)
+
+                Text("Choose larger preview cards for visual scanning, or Cinema for full-width widescreen frames.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

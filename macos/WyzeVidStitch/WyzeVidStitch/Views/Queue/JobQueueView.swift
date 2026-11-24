@@ -2,19 +2,21 @@ import SwiftUI
 import WyzeStitcherKit
 
 struct JobQueueView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(StitcherStore.self) private var store
     @State private var expandedLogJobIds: Set<String> = []
 
     var body: some View {
         VStack(spacing: 0) {
             // Queue Header Bar + Aggregate Batch Progress
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Compilation Queue & History")
-                            .font(.title2.weight(.semibold))
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .bottom) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Render Queue")
+                            .font(.system(size: 26, weight: .bold))
+                            .tracking(-0.3)
                         Text(queueSubtitle)
-                            .font(.subheadline)
+                            .font(.subheadline.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
 
@@ -37,7 +39,7 @@ struct JobQueueView: View {
                             .buttonStyle(.bordered)
                         }
 
-                        Button("Clear History") {
+                        Button("Clear Finished") {
                             store.clearFinishedJobs()
                         }
                         .buttonStyle(.bordered)
@@ -46,30 +48,32 @@ struct JobQueueView: View {
                 }
 
                 if store.activeJobCount > 0 {
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 6) {
                         HStack {
                             Text("Overall Batch Progress")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Text("\(Int((store.aggregateProgress * 100).rounded()))%")
-                                .font(.caption.monospacedDigit())
+                                .font(.system(.caption, design: .monospaced).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                         ProgressView(value: store.aggregateProgress, total: 1.0)
                             .progressViewStyle(.linear)
+                            .tint(StudioTheme.accent)
                     }
                 }
             }
             .padding(24)
 
             Divider()
+                .overlay(StudioTheme.hairlineBorder(for: colorScheme))
 
             if store.jobs.isEmpty {
                 ContentUnavailableView(
-                    "No Compilation Jobs",
-                    systemImage: "tray",
-                    description: Text("Select one or more hours from any recorded day and click Stitch Selected or Stitch Full Day to start compiling.")
+                    "Your Render Queue Is Empty",
+                    systemImage: "square.stack.3d.up",
+                    description: Text("Select one or more recorded hours from any day and click Stitch Selected or Stitch Full Day to compile lossless hourly videos.")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -94,18 +98,22 @@ struct JobQueueView: View {
                         }
                     }
                     .padding(24)
+                    .frame(maxWidth: 1360, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .center)
                 }
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(StudioTheme.canvasBackground(for: colorScheme))
     }
 
     private var queueSubtitle: String {
-        "\(store.activeJobCount) active • \(store.completedJobCount) completed • \(store.jobs.count) total"
+        "\(store.activeJobCount) active · \(store.completedJobCount) completed · \(store.jobs.count) total"
     }
 }
 
 private struct JobRowCard: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     let job: StitchJobSnapshot
     let isShowingLogs: Bool
     let onToggleLogs: () -> Void
@@ -115,65 +123,96 @@ private struct JobRowCard: View {
     let onReveal: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 12) {
-                statusBadge
-
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(StitcherStore.formatDay(job.day))
-                            .font(.headline.monospacedDigit())
-
-                        if job.mode == .fullDay {
-                            Text("Full Day")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.teal.opacity(0.18), in: Capsule())
-                                .foregroundStyle(.teal)
-                        } else {
-                            Text(StitcherStore.formatHour12(job.hour))
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 14) {
+                // Visual Video Thumbnail when Completed
+                if job.status == .completed, let outputPath = job.outputPath {
+                    Button(action: onPlay) {
+                        ZStack {
+                            VideoThumbnailView(filePath: outputPath)
+                            Circle()
+                                .fill(Color.black.opacity(0.62))
+                                .frame(width: 28, height: 28)
+                                .overlay(
+                                    Image(systemName: "play.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.white)
+                                        .offset(x: 1)
+                                )
                         }
+                        .frame(width: 104, height: 58)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(StudioTheme.hairlineBorder(for: colorScheme), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Play compiled video in Theater View")
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        statusIndicator
+
+                        Text("·")
+                            .foregroundStyle(.tertiary)
+
+                        Text(
+                            "\(StudioTheme.formatDateDisplay(job.day, includeWeekday: false)) · \(job.mode == .fullDay ? "Full Day" : StitcherStore.formatHour12(job.hour))"
+                        )
+                        .font(.headline.weight(.semibold))
 
                         if job.usedAudioFallback {
+                            Text("·")
+                                .foregroundStyle(.tertiary)
                             Text("AVFoundation AAC")
-                                .font(.caption2.weight(.medium))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.indigo.opacity(0.16), in: Capsule())
+                                .font(.caption)
                                 .foregroundStyle(.indigo)
                         }
                     }
 
-                    if let outputPath = job.outputPath {
-                        Text((outputPath as NSString).lastPathComponent)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        if job.status == .completed {
+                            Text("\(job.totalClips) clips")
+                            Text("·")
+                            Text(StitcherStore.formatBytes(job.fileSizeBytes))
+                            Text("·")
+                            Text(String(format: "%.1fs", Double(job.durationMs) / 1000.0))
+                        } else {
+                            Text("\(job.processedClips) / \(job.totalClips) clips")
+                        }
+
+                        if let outputPath = job.outputPath {
+                            Text("·")
+                            Text((outputPath as NSString).lastPathComponent)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
+                    .font(.system(.caption, design: .monospaced).monospacedDigit())
+                    .foregroundStyle(.secondary)
                 }
 
                 Spacer()
-
-                metricsView
 
                 actionsView
             }
 
             if job.status == .running || job.status == .remuxingFallback {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 5) {
                     HStack {
                         Text(job.currentClipName ?? "Processing clips...")
-                            .font(.caption)
+                            .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.secondary)
                         Spacer()
                         Text("\(Int((job.progress * 100).rounded()))%")
-                            .font(.caption.monospacedDigit())
+                            .font(.system(.caption, design: .monospaced).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                     ProgressView(value: Double(job.progress), total: 1.0)
                         .progressViewStyle(.linear)
+                        .tint(StudioTheme.accent)
                 }
             }
 
@@ -184,72 +223,67 @@ private struct JobRowCard: View {
                         .textSelection(.enabled)
                 }
                 .font(.caption)
-                .foregroundStyle(.red)
+                .foregroundStyle(StudioTheme.severeGapRed)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(StudioTheme.severeGapRed.opacity(0.1))
+                )
             }
 
             if isShowingLogs {
                 LogConsoleView(logs: job.logs)
             }
         }
-        .padding(14)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(StudioTheme.cardSurface(for: colorScheme))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(
                     job.status == .running || job.status == .remuxingFallback
-                        ? Color.accentColor.opacity(0.6)
-                        : Color(nsColor: .separatorColor),
+                        ? StudioTheme.accent.opacity(0.65)
+                        : StudioTheme.hairlineBorder(for: colorScheme),
                     lineWidth: 1
                 )
         )
     }
 
-    private var statusBadge: some View {
-        let (label, color): (String, Color) = switch job.status {
-        case .pending: ("PENDING", .secondary)
-        case .running: ("MERGING", .accentColor)
-        case .remuxingFallback: ("REMUXING", .indigo)
-        case .completed: ("COMPLETED", .green)
-        case .failed: ("FAILED", .red)
-        case .cancelled: ("CANCELLED", .orange)
-        }
-
-        return Text(label)
-            .font(.caption2.weight(.bold))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(color.opacity(0.16), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-            .foregroundStyle(color)
-    }
-
     @ViewBuilder
-    private var metricsView: some View {
-        HStack(spacing: 12) {
-            if job.status == .completed {
-                Text(StitcherStore.formatBytes(job.fileSizeBytes))
-                Text(String(format: "%.1fs", Double(job.durationMs) / 1000.0))
-            } else if !job.status.isTerminal {
-                Text("\(job.processedClips) / \(job.totalClips) clips")
-            }
+    private var statusIndicator: some View {
+        switch job.status {
+        case .pending:
+            Label("Queued", systemImage: "clock")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+        case .running:
+            Label("Compiling", systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(StudioTheme.accent)
+        case .remuxingFallback:
+            Label("Remuxing Audio", systemImage: "waveform")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.indigo)
+        case .completed:
+            Label("Completed", systemImage: "checkmark.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(StudioTheme.completeGreen)
+        case .failed:
+            Label("Failed", systemImage: "xmark.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(StudioTheme.severeGapRed)
+        case .cancelled:
+            Label("Cancelled", systemImage: "slash.circle")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(StudioTheme.minorGapAmber)
         }
-        .font(.caption.monospacedDigit())
-        .foregroundStyle(.secondary)
     }
 
     private var actionsView: some View {
-        HStack(spacing: 6) {
-            Button {
-                onToggleLogs()
-            } label: {
-                Image(systemName: isShowingLogs ? "terminal.fill" : "terminal")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Toggle job activity log")
-
+        HStack(spacing: 8) {
             if !job.status.isTerminal {
                 Button(job.status == .pending ? "Remove" : "Cancel", role: .destructive) {
                     onCancel()
@@ -275,14 +309,26 @@ private struct JobRowCard: View {
                     Label("Play", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(StudioTheme.accent)
                 .controlSize(.small)
 
-                Button("Reveal") {
+                Button {
                     onReveal()
+                } label: {
+                    Label("Reveal", systemImage: "folder")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
+
+            Button {
+                onToggleLogs()
+            } label: {
+                Label("Logs", systemImage: isShowingLogs ? "terminal.fill" : "terminal")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Toggle job activity log")
         }
     }
 }

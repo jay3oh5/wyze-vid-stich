@@ -2,6 +2,7 @@ import SwiftUI
 import WyzeStitcherKit
 
 struct DayDetailView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(StitcherStore.self) private var store
     let dayRecord: DayRecord
 
@@ -11,28 +12,40 @@ struct DayDetailView: View {
         }.count
     }
 
+    private var dayTotalClips: UInt32 {
+        dayRecord.hours.reduce(0) { $0 + $1.clipCount }
+    }
+
+    private var continuityPercent: Int {
+        let possible = dayRecord.hours.count * 60
+        guard possible > 0 else { return 0 }
+        return Int((Double(dayTotalClips) / Double(possible) * 100.0).rounded())
+    }
+
     private var dayTotalSizeBytes: UInt64 {
         dayRecord.hours.reduce(0) { $0 + $1.totalSizeBytes }
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                // Header & Batch Selection / Full-Day Merge Controls
-                HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(dayRecord.formattedDay)
-                            .font(.title2.weight(.semibold).monospacedDigit())
+            VStack(alignment: .leading, spacing: 22) {
+                // Editorial Day Header & Full-Day Merge Controls
+                HStack(alignment: .bottom, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(StudioTheme.formatDateDisplay(dayRecord.day, includeWeekday: true))
+                            .font(.system(size: 26, weight: .bold))
+                            .tracking(-0.3)
+
                         Text(
-                            "\(dayRecord.hours.count) hours available • \(StitcherStore.formatBytes(dayTotalSizeBytes)) • \(selectedCountInDay) selected"
+                            "\(dayRecord.hours.count) recorded hours · \(dayTotalClips) clips · \(continuityPercent)% continuity · \(StitcherStore.formatBytes(dayTotalSizeBytes))"
                         )
-                        .font(.subheadline)
+                        .font(.subheadline.monospacedDigit())
                         .foregroundStyle(.secondary)
                     }
 
                     Spacer()
 
-                    HStack(spacing: 8) {
+                    HStack(spacing: 10) {
                         Menu {
                             Button {
                                 store.requestStitchFullDay(for: dayRecord, onlySelectedHours: false)
@@ -58,52 +71,31 @@ struct DayDetailView: View {
                             store.requestStitchFullDay(for: dayRecord, onlySelectedHours: false)
                         }
                         .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        .controlSize(.regular)
                         .disabled(dayRecord.hours.isEmpty)
                         .help("Compile all hours in \(dayRecord.formattedDay) into a single continuous MP4")
-
-                        Divider()
-                            .frame(height: 16)
-
-                        Button("Select All") {
-                            withAnimation(.snappy(duration: 0.2)) {
-                                store.selectAllHours(in: dayRecord)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button("Select Gaps") {
-                            withAnimation(.snappy(duration: 0.2)) {
-                                store.selectGapHours(in: dayRecord)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button("Clear") {
-                            withAnimation(.snappy(duration: 0.2)) {
-                                store.clearSelection(in: dayRecord)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
                 }
 
-                // 24-Hour Footage Density Heatmap
+                // Hero Focal Anchor: Large Embedded Cinema Preview Stage
+                CinemaPreviewStageView()
+
+                // Interactive 24-Hour Footage Coverage Timeline
                 Heatmap24hView(dayRecord: dayRecord)
 
-                // Hour Selection Grid
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Recorded Hours")
-                        .font(.headline)
-
-                    HourGridView(dayRecord: dayRecord)
-                }
+                // Large Visual Hour Preview Grid with Size Switcher & Filters
+                HourGridView(dayRecord: dayRecord)
             }
             .padding(24)
+            .frame(maxWidth: 1480, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(StudioTheme.canvasBackground(for: colorScheme))
+        .onAppear {
+            store.syncStagePreviewForDay(dayRecord)
+        }
+        .onChange(of: dayRecord.day) { _, _ in
+            store.syncStagePreviewForDay(dayRecord)
+        }
     }
 }

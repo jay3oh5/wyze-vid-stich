@@ -17,8 +17,9 @@ struct WyzeVidStitchApp: App {
                 .environmentObject(settings)
                 .environment(store)
                 .preferredColorScheme(settings.appearanceMode.colorScheme)
-                .frame(minWidth: 960, minHeight: 640)
+                .frame(minWidth: 1080, minHeight: 700)
         }
+        .defaultSize(width: 1380, height: 880)
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
         .commands {

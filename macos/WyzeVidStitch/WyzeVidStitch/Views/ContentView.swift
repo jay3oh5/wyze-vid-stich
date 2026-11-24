@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 import WyzeStitcherKit
 
 struct ContentView: View {
+    @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var settings: AppSettings
     @Environment(StitcherStore.self) private var store
 
@@ -13,12 +14,13 @@ struct ContentView: View {
 
         NavigationSplitView {
             DaySidebarView()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
         } detail: {
             VStack(spacing: 0) {
                 if let card = store.detectedSDCard {
                     sdCardBanner(card)
                     Divider()
+                        .overlay(StudioTheme.hairlineBorder(for: colorScheme))
                 }
                 detailContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -48,20 +50,20 @@ struct ContentView: View {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Label("Scan", systemImage: "arrow.clockwise")
+                        Label("Rescan", systemImage: "arrow.clockwise")
                     }
                 }
                 .disabled(settings.sourceDir.isEmpty || store.isScanning)
-                .help("Scan source directory (Cmd+R)")
+                .help("Rescan source directory (Cmd+R)")
             }
 
             ToolbarItem(placement: .primaryAction) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     if !store.selectedHours.isEmpty {
                         let estBytes = store.estimatedSelectedBytes()
                         if estBytes > 0 {
                             Text("~\(StitcherStore.formatBytes(estBytes))")
-                                .font(.caption.monospacedDigit())
+                                .font(.system(.caption, design: .monospaced).monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -75,15 +77,20 @@ struct ContentView: View {
                         )
                     }
                     .buttonStyle(.borderedProminent)
+                    .tint(StudioTheme.accent)
                     .disabled(store.selectedHours.isEmpty)
                 }
             }
         }
         .sheet(item: $bindableStore.inspectingTarget) { target in
             ClipInspectorSheet(target: target)
+                .environmentObject(settings)
+                .environment(store)
         }
         .sheet(item: $bindableStore.activePlayback) { playback in
             NativeVideoPlayerSheet(target: playback)
+                .environmentObject(settings)
+                .environment(store)
         }
         .confirmationDialog(
             "Delete Source Clips After Compile?",
@@ -121,13 +128,16 @@ struct ContentView: View {
             if settings.sendNotifications {
                 NotificationService.requestAuthorization()
             }
+            if !settings.sourceDir.isEmpty && store.days.isEmpty && !store.isScanning {
+                Task { await store.scanSourceDirectory() }
+            }
         }
     }
 
     private func sdCardBanner(_ card: DetectedSDCard) -> some View {
         HStack(spacing: 12) {
             Image(systemName: "sdcard.fill")
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(StudioTheme.accent)
                 .font(.title3)
 
             VStack(alignment: .leading, spacing: 2) {
@@ -146,6 +156,7 @@ struct ContentView: View {
                 store.scanDetectedSDCard()
             }
             .buttonStyle(.borderedProminent)
+            .tint(StudioTheme.accent)
             .controlSize(.small)
 
             Button {
@@ -157,9 +168,9 @@ struct ContentView: View {
             .foregroundStyle(.secondary)
             .help("Dismiss")
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 18)
         .padding(.vertical, 10)
-        .background(Color.accentColor.opacity(0.1))
+        .background(StudioTheme.accent.opacity(0.12))
     }
 
     private var dropTargetOverlay: some View {
@@ -167,15 +178,15 @@ struct ContentView: View {
             Rectangle()
                 .fill(.ultraThinMaterial)
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2.5, dash: [8, 6]))
-                .padding(20)
+                .strokeBorder(StudioTheme.accent, style: StrokeStyle(lineWidth: 2.5, dash: [8, 6]))
+                .padding(24)
             VStack(spacing: 10) {
                 Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 42))
-                    .foregroundStyle(Color.accentColor)
+                    .font(.system(size: 44, weight: .light))
+                    .foregroundStyle(StudioTheme.accent)
                 Text("Drop Wyze Record Folder or SD Card")
                     .font(.title3.weight(.semibold))
-                Text("Release to scan footage density and gaps automatically")
+                Text("Release to scan footage density, preview thumbnails, and missing minute gaps automatically")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -222,20 +233,26 @@ struct ContentView: View {
     }
 
     private var emptyWorkspace: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 18) {
             if let scanError = store.scanError {
-                ContentUnavailableView(
-                    "Scan Failed",
-                    systemImage: "exclamationmark.triangle",
-                    description: Text(scanError)
-                )
+                ContentUnavailableView {
+                    Label("Scan Failed", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(scanError)
+                } actions: {
+                    Button("Select Another Folder...") {
+                        store.browseSourceFolder()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(StudioTheme.accent)
+                }
             } else {
                 ContentUnavailableView {
-                    Label("Wyze SD Card Video Stitcher", systemImage: "film.stack")
+                    Label("Wyze Video Stitcher", systemImage: "film.stack")
                 } description: {
                     Text(
                         settings.sourceDir.isEmpty
-                            ? "Select or drop your Wyze camera's /record folder onto this window to scan footage density and missing minute gaps."
+                            ? "Select or drag-and-drop your Wyze microSD card's /record folder onto this window to preview footage, inspect gaps, and stitch lossless hourly videos."
                             : "Ready to scan \(settings.sourceDir)."
                     )
                 } actions: {
@@ -244,6 +261,7 @@ struct ContentView: View {
                             store.browseSourceFolder()
                         }
                         .buttonStyle(.borderedProminent)
+                        .tint(StudioTheme.accent)
 
                         if !settings.sourceDir.isEmpty {
                             Button("Scan Now") {
@@ -255,6 +273,8 @@ struct ContentView: View {
                 }
             }
         }
-        .padding()
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(StudioTheme.canvasBackground(for: colorScheme))
     }
 }

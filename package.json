@@ -13,11 +13,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "lucide-react": "^0.395.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "lucide-react": "^0.395.0"
+    "tailwindcss": "^4.3.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

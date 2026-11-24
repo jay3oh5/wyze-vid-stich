@@ -26,11 +26,58 @@ struct InspectorTarget: Identifiable, Hashable {
     }
 }
 
-/// Identifies a compiled video opened in the native `AVPlayerView` sheet.
+/// Represents a compiled `.mp4` output discovered in the output directory or day folders.
+struct CompiledVideoItem: Identifiable, Hashable {
+    let filePath: String
+    let fileName: String
+    let displayTitle: String
+    let sizeBytes: UInt64
+    let modifiedDate: Date
+
+    var id: String { filePath }
+}
+
+/// Active footage loaded in the embedded Cinema Preview Stage.
+struct StagePreviewState: Equatable {
+    enum Mode: Equatable {
+        case rawHour(day: String, hourRecord: HourRecord, clipFilename: String)
+        case compiled(CompiledVideoItem)
+    }
+
+    let mode: Mode
+    let videoPath: String
+    let autoPlay: Bool
+
+    static func == (lhs: StagePreviewState, rhs: StagePreviewState) -> Bool {
+        lhs.videoPath == rhs.videoPath && lhs.autoPlay == rhs.autoPlay && lhs.mode == rhs.mode
+    }
+}
+
+/// Identifies a video opened in the full-size Theater `AVPlayerView` sheet.
 struct PlaybackTarget: Identifiable {
     let id = UUID()
     let title: String
     let filePath: String
+    let sizeBytes: UInt64?
+    let day: String?
+    let hourRecord: HourRecord?
+    let clipFilename: String?
+
+    init(
+        title: String,
+        filePath: String,
+        sizeBytes: UInt64? = nil,
+        day: String? = nil,
+        hourRecord: HourRecord? = nil,
+        clipFilename: String? = nil
+    ) {
+        self.title = title
+        self.filePath = filePath
+        self.sizeBytes = sizeBytes
+        self.day = day
+        self.hourRecord = hourRecord
+        self.clipFilename = clipFilename
+    }
 }
 
 /// Central `@MainActor @Observable` store bridging the Rust `StitcherEngine` to SwiftUI views.
@@ -42,12 +89,16 @@ final class StitcherStore {
     // Navigation & Scan State
     var sidebarSelection: SidebarSelection?
     var days: [DayRecord] = []
+    var compiledVideos: [CompiledVideoItem] = []
     var lastScanSummary: String = ""
     var isScanning: Bool = false
     var scanError: String?
 
     // Selection State ("YYYYMMDD_HH" keys)
     var selectedHours: Set<String> = []
+
+    // Embedded Cinema Preview Stage State
+    var stagePreview: StagePreviewState?
 
     // Job Queue State
     var jobs: [StitchJobSnapshot] = []
@@ -150,6 +201,108 @@ final class StitcherStore {
         "\(day)_\(hour)"
     }
 
+    func representativeClipPath(for hourRecord: HourRecord) -> String? {
+        guard !hourRecord.clips.isEmpty else { return nil }
+        let midIndex = hourRecord.clips.count / 2
+        let clipName = hourRecord.clips[midIndex]
+        return URL(fileURLWithPath: hourRecord.sourceDirPath)
+            .appendingPathComponent(clipName)
+            .path
+    }
+
+    // MARK: - Cinema Preview Stage Controls
+
+    func previewHour(_ hourRecord: HourRecord, inDay day: String, clipFilename: String? = nil, autoPlay: Bool = false) {
+        guard let clip = clipFilename ?? hourRecord.clips.first else { return }
+        let path = URL(fileURLWithPath: hourRecord.sourceDirPath)
+            .appendingPathComponent(clip)
+            .path
+        stagePreview = StagePreviewState(
+            mode: .rawHour(day: day, hourRecord: hourRecord, clipFilename: clip),
+            videoPath: path,
+            autoPlay: autoPlay
+        )
+    }
+
+    func previewCompiledVideo(_ item: CompiledVideoItem, autoPlay: Bool = true) {
+        stagePreview = StagePreviewState(
+            mode: .compiled(item),
+            videoPath: item.filePath,
+            autoPlay: autoPlay
+        )
+        if case .day = sidebarSelection {
+            // Stay on current day detail so Cinema Preview Stage shows it immediately
+        } else if let firstDay = days.first {
+            sidebarSelection = .day(firstDay.day)
+        } else {
+            // If no day scanned yet, open Theater Sheet directly
+            activePlayback = PlaybackTarget(
+                title: item.displayTitle,
+                filePath: item.filePath,
+                sizeBytes: item.sizeBytes
+            )
+        }
+    }
+
+    func openTheaterForCurrentStage() {
+        guard let stage = stagePreview else { return }
+        switch stage.mode {
+        case .rawHour(let day, let hourRecord, let clipFilename):
+            let title = "\(StudioTheme.formatDateDisplay(day)) · \(StudioTheme.formatHourMinute12(hourRecord.hour, minuteFilename: clipFilename))"
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: stage.videoPath)[.size] as? UInt64)
+            activePlayback = PlaybackTarget(
+                title: title,
+                filePath: stage.videoPath,
+                sizeBytes: fileSize,
+                day: day,
+                hourRecord: hourRecord,
+                clipFilename: clipFilename
+            )
+        case .compiled(let item):
+            activePlayback = PlaybackTarget(
+                title: item.displayTitle,
+                filePath: item.filePath,
+                sizeBytes: item.sizeBytes
+            )
+        }
+    }
+
+    func openTheaterForHour(_ hourRecord: HourRecord, inDay day: String) {
+        guard let clip = hourRecord.clips.first else { return }
+        let path = URL(fileURLWithPath: hourRecord.sourceDirPath)
+            .appendingPathComponent(clip)
+            .path
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64)
+        let title = "\(StudioTheme.formatDateDisplay(day)) · \(StudioTheme.formatHourMinute12(hourRecord.hour, minuteFilename: clip))"
+        stagePreview = StagePreviewState(
+            mode: .rawHour(day: day, hourRecord: hourRecord, clipFilename: clip),
+            videoPath: path,
+            autoPlay: false
+        )
+        activePlayback = PlaybackTarget(
+            title: title,
+            filePath: path,
+            sizeBytes: fileSize,
+            day: day,
+            hourRecord: hourRecord,
+            clipFilename: clip
+        )
+    }
+
+    func syncStagePreviewForDay(_ dayRecord: DayRecord) {
+        if let current = stagePreview {
+            if case .rawHour(let currentDay, _, _) = current.mode, currentDay == dayRecord.day {
+                return
+            }
+            if case .compiled = current.mode {
+                return
+            }
+        }
+        if let firstHour = dayRecord.hours.first(where: { !$0.clips.isEmpty }) {
+            previewHour(firstHour, inDay: dayRecord.day, autoPlay: false)
+        }
+    }
+
     // MARK: - Folder Ingestion (Browse, Drag-and-Drop, SD Auto-Detect)
 
     func browseSourceFolder() {
@@ -207,22 +360,124 @@ final class StitcherStore {
             days = result.days
             lastScanSummary = "\(result.totalDays) days • \(result.totalHours) hours • \(result.totalClips) clips (\(result.scanDurationMs) ms)"
 
-            if let prev = previouslySelectedDay, result.days.contains(where: { $0.day == prev }) {
+            refreshCompiledVideos()
+
+            if let prev = previouslySelectedDay, let matched = result.days.first(where: { $0.day == prev }) {
                 sidebarSelection = .day(prev)
+                if let firstHour = matched.hours.first(where: { !$0.clips.isEmpty }) {
+                    previewHour(firstHour, inDay: matched.day, autoPlay: false)
+                }
             } else if sidebarSelection == .queue {
                 // Keep Queue open if auto-rescan triggered while viewing Queue.
             } else if let firstDay = result.days.first {
                 sidebarSelection = .day(firstDay.day)
+                if let firstHour = firstDay.hours.first(where: { !$0.clips.isEmpty }) {
+                    previewHour(firstHour, inDay: firstDay.day, autoPlay: false)
+                }
             } else {
                 sidebarSelection = nil
+                stagePreview = nil
                 scanError = "No supported Wyze footage found in the selected folder. Ensure the folder contains hour directories with .mp4 clips or a Wyze record structure."
             }
         } catch {
             days = []
+            stagePreview = nil
             scanError = error.localizedDescription
         }
 
         isScanning = false
+    }
+
+    func refreshCompiledVideos() {
+        let fm = FileManager.default
+        var discovered: [CompiledVideoItem] = []
+        var seenPaths: Set<String> = []
+
+        func scanFolder(_ dirPath: String) {
+            guard !dirPath.isEmpty else { return }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dirPath, isDirectory: &isDir), isDir.boolValue else { return }
+            guard let items = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
+            for name in items where name.lowercased().hasSuffix(".mp4") {
+                let fullPath = URL(fileURLWithPath: dirPath).appendingPathComponent(name).path
+                guard !seenPaths.contains(fullPath) else { continue }
+                guard let attrs = try? fm.attributesOfItem(atPath: fullPath),
+                      let fileType = attrs[.type] as? FileAttributeType,
+                      fileType == .typeRegular
+                else { continue }
+
+                seenPaths.insert(fullPath)
+                let size = (attrs[.size] as? UInt64) ?? 0
+                let modDate = (attrs[.modificationDate] as? Date) ?? .distantPast
+                discovered.append(
+                    CompiledVideoItem(
+                        filePath: fullPath,
+                        fileName: name,
+                        displayTitle: Self.prettyCompiledTitle(from: name),
+                        sizeBytes: size,
+                        modifiedDate: modDate
+                    )
+                )
+            }
+        }
+
+        if !settings.customOutputDir.isEmpty {
+            scanFolder(settings.customOutputDir)
+        }
+
+        let source = settings.sourceDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !source.isEmpty {
+            scanFolder(source)
+            for day in days {
+                let dayPath = URL(fileURLWithPath: source).appendingPathComponent(day.day).path
+                scanFolder(dayPath)
+            }
+        }
+
+        for job in jobs where job.status == .completed {
+            if let path = job.outputPath, !seenPaths.contains(path), fm.fileExists(atPath: path) {
+                let name = (path as NSString).lastPathComponent
+                let attrs = try? fm.attributesOfItem(atPath: path)
+                let size = (attrs?[.size] as? UInt64) ?? job.fileSizeBytes
+                let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
+                seenPaths.insert(path)
+                discovered.append(
+                    CompiledVideoItem(
+                        filePath: path,
+                        fileName: name,
+                        displayTitle: Self.prettyCompiledTitle(from: name),
+                        sizeBytes: size,
+                        modifiedDate: modDate
+                    )
+                )
+            }
+        }
+
+        compiledVideos = discovered.sorted { $0.modifiedDate > $1.modifiedDate }
+    }
+
+    private static func prettyCompiledTitle(from filename: String) -> String {
+        let base = (filename as NSString).deletingPathExtension
+        let parts = base.split(separator: "_")
+        if parts.count == 2 {
+            let datePart = String(parts[0]).replacingOccurrences(of: "-", with: "")
+            let timePart = String(parts[1]).replacingOccurrences(of: "!", with: "")
+            if datePart.count == 8 {
+                let dateLabel = StudioTheme.formatDateDisplay(datePart, includeWeekday: false)
+                if timePart.uppercased() == "FULLDAY" || timePart.uppercased() == "ALL" {
+                    return "\(dateLabel) · Full Day"
+                }
+                if timePart.count == 4, timePart.hasSuffix("00") {
+                    let hourPrefix = String(timePart.prefix(2))
+                    return "\(dateLabel) · \(formatHour12(hourPrefix))"
+                }
+                if timePart.count == 2, Int(timePart) != nil {
+                    return "\(dateLabel) · \(formatHour12(timePart))"
+                }
+                return "\(dateLabel) · \(timePart)"
+            }
+        }
+        return base
     }
 
     // MARK: - Hour Selection Mutations
@@ -339,7 +594,6 @@ final class StitcherStore {
     func requestStitchCustomSelection(target: InspectorTarget, clips: [String]) {
         guard !clips.isEmpty else { return }
 
-        // Estimate proportional size for custom subset.
         let fraction = Double(clips.count) / Double(max(target.hourRecord.clipCount, 1))
         let estimatedBytes = UInt64(Double(target.hourRecord.totalSizeBytes) * fraction)
 
@@ -450,8 +704,12 @@ final class StitcherStore {
     func playCompletedJob(_ job: StitchJobSnapshot) {
         guard let outputPath = job.outputPath else { return }
         let suffix = job.mode == .fullDay ? "Full Day" : Self.formatHour12(job.hour)
-        let title = "\(Self.formatDay(job.day)) • \(suffix)"
-        activePlayback = PlaybackTarget(title: title, filePath: outputPath)
+        let title = "\(StudioTheme.formatDateDisplay(job.day)) · \(suffix)"
+        activePlayback = PlaybackTarget(
+            title: title,
+            filePath: outputPath,
+            sizeBytes: job.fileSizeBytes
+        )
     }
 
     func revealJobInFinder(_ job: StitchJobSnapshot) {
@@ -477,6 +735,7 @@ final class StitcherStore {
 
         if snapshot.status == .completed && !knownCompletedJobIds.contains(snapshot.id) {
             knownCompletedJobIds.insert(snapshot.id)
+            refreshCompiledVideos()
             if snapshot.deletedSources {
                 needsRescanOnIdle = true
             }
